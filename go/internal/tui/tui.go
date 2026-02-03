@@ -97,12 +97,14 @@ func (t *MessagesTUI) run() error {
 	// Setup callbacks
 	t.setupCallbacks()
 
-	// Load initial data
-	t.loadConversations()
-
 	// Setup watcher
 	t.watcher.OnNewMessages(t.onNewMessages)
 	t.watcher.OnConversationsUpdated(t.onConversationsUpdated)
+
+	// Load initial data synchronously (before app.Run)
+	t.loadInitialData()
+
+	// Start watcher after initial load
 	t.watcher.Start()
 	defer t.watcher.Stop()
 
@@ -234,6 +236,58 @@ func (t *MessagesTUI) setupCallbacks() {
 
 func (t *MessagesTUI) setStatus(msg string) {
 	t.statusBar.SetText(" " + msg + " ")
+}
+
+// loadInitialData loads data synchronously before the app starts
+func (t *MessagesTUI) loadInitialData() {
+	convs := t.watcher.GetConversations(50)
+
+	t.mu.Lock()
+	t.conversations = convs
+	t.mu.Unlock()
+
+	// Populate UI directly (no QueueUpdateDraw needed before Run())
+	t.convList.Clear()
+	for _, conv := range convs {
+		name := conv.DisplayName
+		if len(name) > 30 {
+			name = name[:27] + "..."
+		}
+
+		secondary := t.formatTime(conv.LastMessageDate)
+		if conv.UnreadCount > 0 {
+			name = fmt.Sprintf("(%d) %s", conv.UnreadCount, name)
+		}
+
+		t.convList.AddItem(name, secondary, 0, nil)
+	}
+
+	// Load first conversation's messages
+	if len(convs) > 0 {
+		t.selectedChatID = convs[0].ChatID
+		msgs := t.watcher.GetMessages(convs[0].ChatID, 100)
+
+		t.mu.Lock()
+		t.messages = msgs
+		t.mu.Unlock()
+
+		t.msgView.SetTitle(fmt.Sprintf(" %s ", convs[0].DisplayName))
+
+		var builder strings.Builder
+		for _, msg := range msgs {
+			timeStr := t.formatTime(msg.Date)
+			if msg.IsFromMe {
+				builder.WriteString(fmt.Sprintf("[green][%s] Me:[-] %s\n", timeStr, msg.Text))
+			} else {
+				sender := msg.Sender
+				if len(sender) > 15 {
+					sender = sender[:12] + "..."
+				}
+				builder.WriteString(fmt.Sprintf("[cyan][%s] %s:[-] %s\n", timeStr, sender, msg.Text))
+			}
+		}
+		t.msgView.SetText(builder.String())
+	}
 }
 
 func (t *MessagesTUI) loadConversations() {
