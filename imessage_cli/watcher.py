@@ -13,6 +13,23 @@ from .database import get_db_path, get_connection, apple_time_to_datetime, extra
 from .contacts import get_contact_name
 
 
+def _resolve_sender(is_from_me: bool, sender_id: Optional[str]) -> str:
+    """Resolve a sender identifier to a display name.
+    
+    Args:
+        is_from_me: Whether the message is from the current user
+        sender_id: The sender's identifier (phone/email)
+        
+    Returns:
+        Resolved sender name or 'Unknown' if not resolvable
+    """
+    if is_from_me:
+        return 'Me'
+    if sender_id:
+        return get_contact_name(sender_id)
+    return 'Unknown'
+
+
 @dataclass
 class Message:
     """Represents an iMessage."""
@@ -190,15 +207,6 @@ class MessageWatcher:
             if not text:
                 text = "[Attachment]"
             
-            # Resolve sender to contact name
-            sender_id = row[6]
-            if row[4]:  # is_from_me
-                sender = 'Me'
-            elif sender_id:
-                sender = get_contact_name(sender_id)
-            else:
-                sender = 'Unknown'
-            
             # Resolve chat name
             chat_identifier = row[8] or ""
             chat_name = row[9] or get_contact_name(chat_identifier) or "Unknown"
@@ -209,7 +217,7 @@ class MessageWatcher:
                 date=msg_date,
                 is_from_me=bool(row[4]),
                 is_read=bool(row[5]),
-                sender=sender,
+                sender=_resolve_sender(row[4], row[6]),
                 chat_id=row[7],
                 chat_identifier=chat_identifier,
                 chat_name=chat_name
@@ -259,15 +267,6 @@ class MessageWatcher:
             if not text:
                 text = "[Attachment]"
             
-            # Resolve sender to contact name
-            sender_id = row[6]
-            if row[4]:  # is_from_me
-                sender = 'Me'
-            elif sender_id:
-                sender = get_contact_name(sender_id)
-            else:
-                sender = 'Unknown'
-            
             # Resolve chat name
             chat_identifier = row[8] or ""
             chat_name = row[9] or get_contact_name(chat_identifier) or "Unknown"
@@ -278,7 +277,7 @@ class MessageWatcher:
                 date=msg_date,
                 is_from_me=bool(row[4]),
                 is_read=bool(row[5]),
-                sender=sender,
+                sender=_resolve_sender(row[4], row[6]),
                 chat_id=row[7],
                 chat_identifier=chat_identifier,
                 chat_name=chat_name

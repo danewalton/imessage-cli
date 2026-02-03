@@ -13,6 +13,23 @@ def _get_contact_name(identifier: str) -> str:
     return get_contact_name(identifier)
 
 
+def _resolve_sender(is_from_me: bool, sender_id: Optional[str]) -> str:
+    """Resolve a sender identifier to a display name.
+    
+    Args:
+        is_from_me: Whether the message is from the current user
+        sender_id: The sender's identifier (phone/email)
+        
+    Returns:
+        Resolved sender name or 'Unknown' if not resolvable
+    """
+    if is_from_me:
+        return 'Me'
+    if sender_id:
+        return _get_contact_name(sender_id)
+    return 'Unknown'
+
+
 def extract_text_from_attributed_body(attributed_body: bytes) -> Optional[str]:
     """Extract plain text from an attributedBody blob.
     
@@ -255,15 +272,6 @@ def get_messages(
         if not text:
             text = '[Attachment]'
         
-        # Resolve sender to contact name
-        sender_id = row['sender_id']
-        if row['is_from_me']:
-            sender = 'Me'
-        elif sender_id:
-            sender = _get_contact_name(sender_id)
-        else:
-            sender = 'Unknown'
-        
         messages.append({
             'message_id': row['message_id'],
             'text': text,
@@ -271,7 +279,7 @@ def get_messages(
             'is_from_me': bool(row['is_from_me']),
             'is_read': bool(row['is_read']),
             'service': row['service'],
-            'sender': sender,
+            'sender': _resolve_sender(row['is_from_me'], row['sender_id']),
         })
     
     # Reverse to show oldest first
@@ -330,15 +338,6 @@ def search_messages(query: str, limit: int = 50) -> List[dict]:
         if not text:
             text = '[Attachment]'
         
-        # Resolve sender to contact name
-        sender_id = row['sender_id']
-        if row['is_from_me']:
-            sender = 'Me'
-        elif sender_id:
-            sender = _get_contact_name(sender_id)
-        else:
-            sender = 'Unknown'
-        
         # Resolve chat name
         chat_identifier = row['chat_identifier'] or ""
         chat_name = row['display_name']
@@ -352,7 +351,7 @@ def search_messages(query: str, limit: int = 50) -> List[dict]:
             'is_from_me': bool(row['is_from_me']),
             'chat_identifier': chat_identifier,
             'chat_name': chat_name,
-            'sender': sender,
+            'sender': _resolve_sender(row['is_from_me'], row['sender_id']),
         })
     
     return results
