@@ -7,6 +7,83 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 
+def extract_text_from_attributed_body(attributed_body: bytes) -> Optional[str]:
+    """Extract plain text from an attributedBody blob.
+    
+    The attributedBody column contains a serialized NSAttributedString.
+    This function uses heuristics to extract the plain text content.
+    
+    Args:
+        attributed_body: The raw bytes from the attributedBody column
+        
+    Returns:
+        The extracted text, or None if extraction fails
+    """
+    if attributed_body is None:
+        return None
+    
+    try:
+        # Decode as UTF-8, replacing invalid characters
+        decoded = attributed_body.decode('utf-8', errors='replace')
+        
+        # Method 1: The attributed body contains serialized NSAttributedString data
+        # The actual text is typically between NSString and NSDictionary/NSNumber markers
+        if "NSNumber" in decoded:
+            temp = decoded.split("NSNumber")[0]
+            if "NSString" in temp:
+                temp = temp.split("NSString")[1]
+                if "NSDictionary" in temp:
+                    temp = temp.split("NSDictionary")[0]
+                    # Remove leading/trailing serialization bytes
+                    # The format is typically: some_bytes + text + some_bytes
+                    text = temp[6:-12] if len(temp) > 18 else temp
+                    # Clean up the text
+                    cleaned = ''.join(c for c in text if c.isprintable() or c in '\n\t')
+                    if cleaned.strip():
+                        return cleaned.strip()
+        
+        # Method 2: Try to find text after streamtyped marker
+        if b'streamtyped' in attributed_body:
+            # The text often appears after certain byte sequences
+            parts = attributed_body.split(b'NSString')
+            if len(parts) > 1:
+                # Take content after NSString marker
+                text_part = parts[1]
+                # Decode and clean up
+                text = text_part.decode('utf-8', errors='replace')
+                # Remove non-printable characters and trim
+                cleaned = ''.join(c for c in text if c.isprintable() or c in '\n\t')
+                # Find where the actual text ends (before next marker)
+                for marker in ['NSDictionary', 'NSNumber', 'NSArray']:
+                    if marker in cleaned:
+                        cleaned = cleaned.split(marker)[0]
+                cleaned = cleaned.strip()
+                if len(cleaned) > 1:
+                    return cleaned
+        
+        # Method 3: Look for any readable text between common delimiters
+        # Try to find the longest sequence of printable characters
+        import re
+        # Find sequences of printable ASCII/Unicode characters
+        matches = re.findall(r'[\x20-\x7E\u00A0-\uFFFF]{3,}', decoded)
+        if matches:
+            # Filter out known serialization artifacts
+            filtered = [m for m in matches if not any(
+                marker in m for marker in ['bplist', 'NSString', 'NSNumber', 'NSDictionary', 
+                                           'NSArray', 'NSData', '$class', 'archiver', 'streamtyped']
+            )]
+            if filtered:
+                # Return the longest match that looks like actual content
+                candidates = [m.strip() for m in filtered if len(m.strip()) > 2]
+                if candidates:
+                    return max(candidates, key=len)
+        
+        return None
+        
+    except Exception:
+        return None
+
+
 def get_db_path() -> Path:
     """Get the path to the iMessage database."""
     return Path.home() / "Library" / "Messages" / "chat.db"
@@ -132,6 +209,7 @@ def get_messages(
     SELECT 
         m.ROWID as message_id,
         m.text,
+        m.attributedBody,
         m.date,
         m.is_from_me,
         m.is_read,
@@ -154,9 +232,19 @@ def get_messages(
     messages = []
     for row in rows:
         msg_date = apple_time_to_datetime(row['date'])
+        
+        # Try to get text from the text column first, then fall back to attributedBody
+        text = row['text']
+        if not text and row['attributedBody']:
+            text = extract_text_from_attributed_body(row['attributedBody'])
+        
+        # Final fallback if no text could be extracted
+        if not text:
+            text = '[Attachment]'
+        
         messages.append({
             'message_id': row['message_id'],
-            'text': row['text'] or '[Attachment or unsupported content]',
+            'text': text,
             'date': msg_date,
             'is_from_me': bool(row['is_from_me']),
             'is_read': bool(row['is_read']),
@@ -182,10 +270,12 @@ def search_messages(query: str, limit: int = 50) -> List[dict]:
     conn = get_connection()
     cursor = conn.cursor()
     
+    # Search in both text column and attributedBody
     sql = """
     SELECT 
         m.ROWID as message_id,
         m.text,
+        m.attributedBody,
         m.date,
         m.is_from_me,
         c.chat_identifier,
@@ -195,21 +285,31 @@ def search_messages(query: str, limit: int = 50) -> List[dict]:
     LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
     LEFT JOIN chat c ON cmj.chat_id = c.ROWID
     LEFT JOIN handle h ON m.handle_id = h.ROWID
-    WHERE m.text LIKE ?
+    WHERE m.text LIKE ? OR m.attributedBody LIKE ?
     ORDER BY m.date DESC
     LIMIT ?
     """
     
-    cursor.execute(sql, (f'%{query}%', limit))
+    search_pattern = f'%{query}%'
+    cursor.execute(sql, (search_pattern, search_pattern.encode('utf-8'), limit))
     rows = cursor.fetchall()
     conn.close()
     
     results = []
     for row in rows:
         msg_date = apple_time_to_datetime(row['date'])
+        
+        # Try to get text from the text column first, then fall back to attributedBody
+        text = row['text']
+        if not text and row['attributedBody']:
+            text = extract_text_from_attributed_body(row['attributedBody'])
+        
+        if not text:
+            text = '[Attachment]'
+        
         results.append({
             'message_id': row['message_id'],
-            'text': row['text'],
+            'text': text,
             'date': msg_date,
             'is_from_me': bool(row['is_from_me']),
             'chat_identifier': row['chat_identifier'],

@@ -111,6 +111,8 @@ class MessagesTUI:
         self.input_box: Optional[InputBox] = None
         self.status_message = ""
         self.error_message = ""
+        self._status_timestamp: Optional[datetime] = None
+        self._status_duration = 3.0  # seconds to show status messages
         
         # Threading
         self.update_queue = queue.Queue()
@@ -208,13 +210,13 @@ class MessagesTUI:
                     self._draw_messages()
                     self._draw_conversations()  # Update unread counts
                     
-                    # Flash notification
+                    # Show notification for incoming messages
                     if data and not data[-1].is_from_me:
-                        self.status_message = f"New message from {data[-1].sender}"
+                        self._set_status(f"📬 New message from {data[-1].sender}")
                         curses.flash()
                         
                 elif update_type == 'error':
-                    self.error_message = str(data)
+                    self._set_status(str(data), is_error=True)
                     
         except queue.Empty:
             pass
@@ -402,6 +404,15 @@ class MessagesTUI:
         """Draw the status bar."""
         self.status_win.erase()
         
+        # Check if status message should be cleared (expired)
+        now = datetime.now()
+        if self._status_timestamp:
+            elapsed = (now - self._status_timestamp).total_seconds()
+            if elapsed > self._status_duration:
+                self.status_message = ""
+                self.error_message = ""
+                self._status_timestamp = None
+        
         # Build status line
         if self.error_message:
             status = f" Error: {self.error_message}"
@@ -416,7 +427,7 @@ class MessagesTUI:
                 'input': '[INPUT]'
             }.get(self.focus, '')
             
-            help_text = "↑↓:Nav  Enter:Select  i:Input  Tab:Switch  q:Quit"
+            help_text = "↑↓:Nav  Enter:Select  i:Input  Tab:Switch  r:Refresh  q:Quit"
             status = f" {focus_indicator} {help_text}"
             self.status_win.attron(curses.color_pair(self.COLOR_STATUS))
         
@@ -428,10 +439,17 @@ class MessagesTUI:
         self.status_win.attroff(curses.color_pair(self.COLOR_STATUS))
         self.status_win.attroff(curses.color_pair(self.COLOR_ERROR))
         self.status_win.refresh()
-        
-        # Clear messages after a while
-        self.status_message = ""
-        self.error_message = ""
+    
+    def _set_status(self, message: str, is_error: bool = False):
+        """Set a status message with timestamp for auto-clear."""
+        if is_error:
+            self.error_message = message
+            self.status_message = ""
+        else:
+            self.status_message = message
+            self.error_message = ""
+        self._status_timestamp = datetime.now()
+        self._draw_status()
     
     def _draw_input(self):
         """Draw the input box."""
@@ -488,22 +506,22 @@ class MessagesTUI:
             return
         
         if not self.selected_chat_id or not self.conversations:
-            self.error_message = "No conversation selected"
+            self._set_status("No conversation selected", is_error=True)
             return
         
         conv = next((c for c in self.conversations if c.chat_id == self.selected_chat_id), None)
         if not conv:
-            self.error_message = "Conversation not found"
+            self._set_status("Conversation not found", is_error=True)
             return
         
         try:
             success = send_message(conv.chat_identifier, text)
             if success:
-                self.status_message = "Message sent!"
+                self._set_status("✓ Message sent!")
             else:
-                self.error_message = "Failed to send message"
+                self._set_status("Failed to send message", is_error=True)
         except Exception as e:
-            self.error_message = f"Send error: {str(e)[:30]}"
+            self._set_status(f"Send error: {str(e)[:30]}", is_error=True)
     
     def _handle_resize(self):
         """Handle terminal resize."""
@@ -538,6 +556,9 @@ class MessagesTUI:
             while self.running:
                 # Process any updates from watcher
                 self._process_updates()
+                
+                # Update status bar periodically to clear expired messages
+                self._draw_status()
                 
                 # Get input
                 try:
@@ -592,8 +613,7 @@ class MessagesTUI:
                         if self.selected_chat_id:
                             self.messages = self.watcher.get_messages(self.selected_chat_id)
                         self.draw_all()
-                        self.status_message = "Refreshed"
-                        self._draw_status()
+                        self._set_status("🔄 Refreshed")
                 
                 elif self.focus == 'messages':
                     if key == ord('q') or key == ord('Q'):
@@ -634,8 +654,7 @@ class MessagesTUI:
                             self.messages = self.watcher.get_messages(self.selected_chat_id)
                             self.message_scroll = max(0, len(self.messages) - self._visible_message_lines())
                         self._draw_messages()
-                        self.status_message = "Refreshed"
-                        self._draw_status()
+                        self._set_status("🔄 Refreshed")
         
         finally:
             self.watcher.stop()

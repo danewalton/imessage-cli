@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, List, Optional
 
-from .database import get_db_path, get_connection, apple_time_to_datetime
+from .database import get_db_path, get_connection, apple_time_to_datetime, extract_text_from_attributed_body
 
 
 @dataclass
@@ -146,6 +146,7 @@ class MessageWatcher:
         SELECT 
             m.ROWID as message_id,
             m.text,
+            m.attributedBody,
             m.date,
             m.is_from_me,
             m.is_read,
@@ -168,17 +169,25 @@ class MessageWatcher:
         
         messages = []
         for row in rows:
-            msg_date = apple_time_to_datetime(row[2])
+            msg_date = apple_time_to_datetime(row[3])
+            
+            # Try to get text from the text column first, then fall back to attributedBody
+            text = row[1]
+            if not text and row[2]:
+                text = extract_text_from_attributed_body(row[2])
+            if not text:
+                text = "[Attachment]"
+            
             messages.append(Message(
                 message_id=row[0],
-                text=row[1] or "[Attachment]",
+                text=text,
                 date=msg_date,
-                is_from_me=bool(row[3]),
-                is_read=bool(row[4]),
-                sender='Me' if row[3] else (row[5] or 'Unknown'),
-                chat_id=row[6],
-                chat_identifier=row[7],
-                chat_name=row[8] or row[7] or "Unknown"
+                is_from_me=bool(row[4]),
+                is_read=bool(row[5]),
+                sender='Me' if row[4] else (row[6] or 'Unknown'),
+                chat_id=row[7],
+                chat_identifier=row[8],
+                chat_name=row[9] or row[8] or "Unknown"
             ))
         
         # Return in chronological order
@@ -194,6 +203,7 @@ class MessageWatcher:
         SELECT 
             m.ROWID as message_id,
             m.text,
+            m.attributedBody,
             m.date,
             m.is_from_me,
             m.is_read,
@@ -215,17 +225,25 @@ class MessageWatcher:
         
         messages = []
         for row in rows:
-            msg_date = apple_time_to_datetime(row[2])
+            msg_date = apple_time_to_datetime(row[3])
+            
+            # Try to get text from the text column first, then fall back to attributedBody
+            text = row[1]
+            if not text and row[2]:
+                text = extract_text_from_attributed_body(row[2])
+            if not text:
+                text = "[Attachment]"
+            
             messages.append(Message(
                 message_id=row[0],
-                text=row[1] or "[Attachment]",
+                text=text,
                 date=msg_date,
-                is_from_me=bool(row[3]),
-                is_read=bool(row[4]),
-                sender='Me' if row[3] else (row[5] or 'Unknown'),
-                chat_id=row[6],
-                chat_identifier=row[7],
-                chat_name=row[8] or row[7] or "Unknown"
+                is_from_me=bool(row[4]),
+                is_read=bool(row[5]),
+                sender='Me' if row[4] else (row[6] or 'Unknown'),
+                chat_id=row[7],
+                chat_identifier=row[8],
+                chat_name=row[9] or row[8] or "Unknown"
             ))
         
         return messages
