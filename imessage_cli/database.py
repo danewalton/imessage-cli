@@ -270,7 +270,8 @@ def search_messages(query: str, limit: int = 50) -> List[dict]:
     conn = get_connection()
     cursor = conn.cursor()
     
-    # Search in both text column and attributedBody
+    # Search in the text column. For attributedBody, we need to cast to text first.
+    # Using CAST(attributedBody AS TEXT) allows partial matching of text embedded in the blob.
     sql = """
     SELECT 
         m.ROWID as message_id,
@@ -285,13 +286,13 @@ def search_messages(query: str, limit: int = 50) -> List[dict]:
     LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
     LEFT JOIN chat c ON cmj.chat_id = c.ROWID
     LEFT JOIN handle h ON m.handle_id = h.ROWID
-    WHERE m.text LIKE ? OR m.attributedBody LIKE ?
+    WHERE m.text LIKE ? OR CAST(m.attributedBody AS TEXT) LIKE ?
     ORDER BY m.date DESC
     LIMIT ?
     """
     
     search_pattern = f'%{query}%'
-    cursor.execute(sql, (search_pattern, search_pattern.encode('utf-8'), limit))
+    cursor.execute(sql, (search_pattern, search_pattern, limit))
     rows = cursor.fetchall()
     conn.close()
     
