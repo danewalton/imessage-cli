@@ -6,6 +6,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+# Import contact resolver (lazy import to avoid circular imports)
+def _get_contact_name(identifier: str) -> str:
+    """Get contact name with lazy import to avoid circular imports."""
+    from .contacts import get_contact_name
+    return get_contact_name(identifier)
+
 
 def extract_text_from_attributed_body(attributed_body: bytes) -> Optional[str]:
     """Extract plain text from an attributedBody blob.
@@ -164,10 +170,17 @@ def get_conversations(limit: int = 50) -> List[dict]:
     conversations = []
     for row in rows:
         last_date = apple_time_to_datetime(row['last_message_date'])
+        chat_identifier = row['chat_identifier'] or ""
+        
+        # Use existing display_name or resolve from contacts
+        display_name = row['display_name']
+        if not display_name:
+            display_name = _get_contact_name(chat_identifier)
+        
         conversations.append({
             'chat_id': row['chat_id'],
-            'chat_identifier': row['chat_identifier'],
-            'display_name': row['display_name'] or row['chat_identifier'],
+            'chat_identifier': chat_identifier,
+            'display_name': display_name,
             'service': row['service_name'],
             'last_message_date': last_date,
             'participants': row['participants'].split(',') if row['participants'] else []
@@ -242,6 +255,15 @@ def get_messages(
         if not text:
             text = '[Attachment]'
         
+        # Resolve sender to contact name
+        sender_id = row['sender_id']
+        if row['is_from_me']:
+            sender = 'Me'
+        elif sender_id:
+            sender = _get_contact_name(sender_id)
+        else:
+            sender = 'Unknown'
+        
         messages.append({
             'message_id': row['message_id'],
             'text': text,
@@ -249,7 +271,7 @@ def get_messages(
             'is_from_me': bool(row['is_from_me']),
             'is_read': bool(row['is_read']),
             'service': row['service'],
-            'sender': 'Me' if row['is_from_me'] else (row['sender_id'] or 'Unknown'),
+            'sender': sender,
         })
     
     # Reverse to show oldest first
@@ -308,14 +330,29 @@ def search_messages(query: str, limit: int = 50) -> List[dict]:
         if not text:
             text = '[Attachment]'
         
+        # Resolve sender to contact name
+        sender_id = row['sender_id']
+        if row['is_from_me']:
+            sender = 'Me'
+        elif sender_id:
+            sender = _get_contact_name(sender_id)
+        else:
+            sender = 'Unknown'
+        
+        # Resolve chat name
+        chat_identifier = row['chat_identifier'] or ""
+        chat_name = row['display_name']
+        if not chat_name:
+            chat_name = _get_contact_name(chat_identifier)
+        
         results.append({
             'message_id': row['message_id'],
             'text': text,
             'date': msg_date,
             'is_from_me': bool(row['is_from_me']),
-            'chat_identifier': row['chat_identifier'],
-            'chat_name': row['display_name'] or row['chat_identifier'],
-            'sender': 'Me' if row['is_from_me'] else (row['sender_id'] or 'Unknown'),
+            'chat_identifier': chat_identifier,
+            'chat_name': chat_name,
+            'sender': sender,
         })
     
     return results
