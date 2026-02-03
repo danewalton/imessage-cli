@@ -157,7 +157,20 @@ var tuiCmd = &cobra.Command{
 	Aliases: []string{"ui", "watch"},
 	Short:   "Launch interactive TUI with live updates",
 	Run: func(cmd *cobra.Command, args []string) {
-		cmdTUI()
+		// Read debug flag from the command's flags to avoid init-time cycles
+		debug, _ := cmd.Flags().GetBool("debug")
+		if debug {
+			if err := tui.RunWithDebug(true, ""); err != nil {
+				fmt.Println(colored(fmt.Sprintf("Error launching TUI: %v", err), colorRed))
+				os.Exit(1)
+			}
+			return
+		}
+
+		if err := tui.Run(); err != nil {
+			fmt.Println(colored(fmt.Sprintf("Error launching TUI: %v", err), colorRed))
+			os.Exit(1)
+		}
 	},
 }
 
@@ -181,6 +194,8 @@ func init() {
 	rootCmd.AddCommand(chatCmd)
 	rootCmd.AddCommand(searchCmd)
 	rootCmd.AddCommand(statusCmd)
+	// Add tui command with debug flag
+	tuiCmd.Flags().BoolP("debug", "d", false, "Enable TUI debug logging to /tmp/imessage-tui.log")
 	rootCmd.AddCommand(tuiCmd)
 	rootCmd.AddCommand(versionCmd)
 }

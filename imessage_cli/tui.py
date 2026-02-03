@@ -211,12 +211,28 @@ class MessagesTUI:
                     self._draw_conversations()
 
                 elif update_type == "new_messages":
-                    # Check if any messages are for the current chat
-                    for msg in data:
-                        if msg.chat_id == self.selected_chat_id:
-                            self.messages.append(msg)
-                    # Draw messages and auto-scroll based on wrapped lines
-                    self._draw_messages(autoscroll=True)
+                    # If any incoming messages belong to the currently
+                    # selected conversation, reload that conversation's
+                    # messages from the watcher so wrapping/ordering is
+                    # consistent, then autoscroll to bottom.
+                    any_for_current = any(
+                        msg.chat_id == self.selected_chat_id for msg in data
+                    )
+
+                    if any_for_current and self.selected_chat_id:
+                        try:
+                            self.messages = self.watcher.get_messages(
+                                self.selected_chat_id
+                            )
+                        except Exception:
+                            # Fallback: append messages we received
+                            for msg in data:
+                                if msg.chat_id == self.selected_chat_id:
+                                    self.messages.append(msg)
+                        self._draw_messages(autoscroll=True)
+                    else:
+                        # No change to current messages, just redraw conversations
+                        self._draw_messages()
                     self._draw_conversations()  # Update unread counts
 
                     # Show notification for incoming messages

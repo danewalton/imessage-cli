@@ -3,6 +3,8 @@ package tui
 
 import (
 	"fmt"
+	"log"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +32,10 @@ type MessagesTUI struct {
 	selectedChatIdx int
 
 	mu sync.RWMutex
+	// logging
+	logger  *log.Logger
+	logFile *os.File
+	debug   bool
 }
 
 // NewMessagesTUI creates a new TUI instance.
@@ -39,6 +45,32 @@ func NewMessagesTUI() *MessagesTUI {
 	}
 }
 
+// RunWithDebug runs the TUI with optional debug logging to the provided path.
+func RunWithDebug(enable bool, logPath string) error {
+	t := NewMessagesTUI()
+	t.debug = enable
+	if enable {
+		if logPath == "" {
+			logPath = "/tmp/imessage-tui.log"
+		}
+		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			return fmt.Errorf("unable to open log file: %w", err)
+		}
+		t.logFile = f
+		t.logger = log.New(f, "tui: ", log.LstdFlags|log.Lmicroseconds)
+		t.logf("debug logging enabled, file=%s", logPath)
+	}
+	defer func() {
+		if t.logFile != nil {
+			t.logFile.Sync()
+			t.logFile.Close()
+		}
+	}()
+
+	return t.run()
+}
+
 // Run starts the TUI application.
 func Run() error {
 	tui := NewMessagesTUI()
@@ -46,6 +78,9 @@ func Run() error {
 }
 
 func (t *MessagesTUI) run() error {
+	if t.logger != nil {
+		t.logf("run: starting TUI run")
+	}
 	t.app = tview.NewApplication()
 
 	// Create conversation list
@@ -94,9 +129,6 @@ func (t *MessagesTUI) run() error {
 	t.pages = tview.NewPages().
 		AddPage("main", mainLayout, true, true)
 
-	// Setup callbacks
-	t.setupCallbacks()
-
 	// Setup watcher
 	t.watcher.OnNewMessages(t.onNewMessages)
 	t.watcher.OnConversationsUpdated(t.onConversationsUpdated)
@@ -104,15 +136,41 @@ func (t *MessagesTUI) run() error {
 	// Load initial data synchronously (before app.Run)
 	t.loadInitialData()
 
+	// Register UI callbacks after initial population to avoid triggering them
+	// while we're still populating the list (which can cause QueueUpdateDraw
+	// to block if called before app.Run()).
+	if t.logger != nil {
+		t.logf("run: registering callbacks after initial load")
+	}
+	t.setupCallbacks()
+
 	// Start watcher after initial load
+	if t.logger != nil {
+		t.logf("run: starting watcher")
+	}
 	t.watcher.Start()
-	defer t.watcher.Stop()
+	defer func() {
+		if t.logger != nil {
+			t.logf("run: stopping watcher")
+		}
+		t.watcher.Stop()
+	}()
 
 	// Run the application
-	return t.app.SetRoot(t.pages, true).EnableMouse(true).Run()
+	if t.logger != nil {
+		t.logf("run: entering app.Run()")
+	}
+	err := t.app.SetRoot(t.pages, true).EnableMouse(true).Run()
+	if err != nil && t.logger != nil {
+		t.logf("run: app.Run error: %v", err)
+	}
+	return err
 }
 
 func (t *MessagesTUI) setupCallbacks() {
+	if t.logger != nil {
+		t.logf("setupCallbacks: registering callbacks")
+	}
 	// Conversation selection
 	t.convList.SetChangedFunc(func(index int, mainText, secondaryText string, shortcut rune) {
 		t.selectedChatIdx = index
@@ -121,7 +179,8 @@ func (t *MessagesTUI) setupCallbacks() {
 			conv := t.conversations[index]
 			t.selectedChatID = conv.ChatID
 			t.mu.RUnlock()
-			t.loadMessages(conv.ChatID)
+			// Run in goroutine to avoid deadlock when called from within QueueUpdateDraw
+			go t.loadMessages(conv.ChatID)
 		} else {
 			t.mu.RUnlock()
 		}
@@ -149,6 +208,14 @@ func (t *MessagesTUI) setupCallbacks() {
 	// Global key handling
 	t.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		focused := t.app.GetFocus()
+		if t.logger != nil {
+			// Log basic input event info for debugging frozen UI issues
+			var r rune
+			if event != nil {
+				r = event.Rune()
+			}
+			t.logf("input event: key=%v rune=%q focused=%T", event.Key(), r, focused)
+		}
 
 		// Handle input field separately
 		if focused == t.inputField {
@@ -238,9 +305,19 @@ func (t *MessagesTUI) setStatus(msg string) {
 	t.statusBar.SetText(" " + msg + " ")
 }
 
+func (t *MessagesTUI) logf(format string, v ...interface{}) {
+	if t.logger != nil {
+		t.logger.Printf(format, v...)
+	}
+}
+
 // loadInitialData loads data synchronously before the app starts
 func (t *MessagesTUI) loadInitialData() {
 	convs := t.watcher.GetConversations(50)
+
+	if t.logger != nil {
+		t.logf("loadInitialData: got %d conversations", len(convs))
+	}
 
 	t.mu.Lock()
 	t.conversations = convs
@@ -315,7 +392,8 @@ func (t *MessagesTUI) loadConversations() {
 
 		if len(convs) > 0 && t.selectedChatID == 0 {
 			t.selectedChatID = convs[0].ChatID
-			t.loadMessages(convs[0].ChatID)
+			// Run in goroutine to avoid deadlock from nested QueueUpdateDraw
+			go t.loadMessages(convs[0].ChatID)
 		}
 	})
 }
@@ -407,6 +485,9 @@ func (t *MessagesTUI) refresh() {
 }
 
 func (t *MessagesTUI) onNewMessages(msgs []watcher.Message) {
+	if t.logger != nil {
+		t.logf("onNewMessages: received %d messages", len(msgs))
+	}
 	t.mu.RLock()
 	currentChatID := t.selectedChatID
 	t.mu.RUnlock()
@@ -428,6 +509,9 @@ func (t *MessagesTUI) onNewMessages(msgs []watcher.Message) {
 }
 
 func (t *MessagesTUI) onConversationsUpdated(convs []watcher.Conversation) {
+	if t.logger != nil {
+		t.logf("onConversationsUpdated: got %d convs", len(convs))
+	}
 	t.mu.Lock()
 	t.conversations = convs
 	t.mu.Unlock()

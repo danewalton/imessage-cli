@@ -313,14 +313,22 @@ func (w *MessageWatcher) Start() {
 		return
 	}
 
-	w.lastMessageID = w.getLastMessageID()
-	w.lastMtime = w.getDBMtime()
+	// Mark running and create stop channel immediately to avoid blocking
 	w.running = true
 	w.stopCh = make(chan struct{})
 	w.mu.Unlock()
 
+	// Start poll loop in a goroutine; perform initial DB checks there to avoid blocking caller
 	w.wg.Add(1)
-	go w.pollLoop()
+	go func() {
+		// Initialize last IDs / mtime inside goroutine
+		w.mu.Lock()
+		w.lastMessageID = w.getLastMessageID()
+		w.lastMtime = w.getDBMtime()
+		w.mu.Unlock()
+
+		w.pollLoop()
+	}()
 }
 
 // Stop stops watching for messages.
