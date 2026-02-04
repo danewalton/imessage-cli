@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/danewalton/imessage-cli/internal/sender"
@@ -23,6 +25,7 @@ const (
 	MaxDisplayNameLength     = 30
 	MaxSenderNameLength      = 15
 	MessageRefreshDelay      = 500 * time.Millisecond
+	LockFileName             = ".imessage-tui.lock"
 )
 
 // MessagesTUI is the main TUI application.
@@ -44,6 +47,8 @@ type MessagesTUI struct {
 	mu sync.RWMutex
 	// sendingMessage tracks whether a message send is in progress
 	sendingMessage atomic.Bool
+	// refreshing tracks whether a refresh is in progress
+	refreshing atomic.Bool
 	// logging
 	logger  *log.Logger
 	logFile *os.File
@@ -57,8 +62,48 @@ func NewMessagesTUI() *MessagesTUI {
 	}
 }
 
+// acquireLock attempts to acquire an exclusive lock to prevent multiple instances.
+// Returns the lock file handle (caller must close it) or an error.
+func acquireLock() (*os.File, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("cannot get home directory: %w", err)
+	}
+
+	lockPath := filepath.Join(home, LockFileName)
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open lock file: %w", err)
+	}
+
+	// Try to acquire an exclusive lock (non-blocking)
+	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("another instance of imessage-tui is already running (lock file: %s)", lockPath)
+	}
+
+	// Write PID to lock file for debugging
+	f.Truncate(0)
+	f.Seek(0, 0)
+	fmt.Fprintf(f, "%d\n", os.Getpid())
+	f.Sync()
+
+	return f, nil
+}
+
 // RunWithDebug runs the TUI with optional debug logging to the provided path.
 func RunWithDebug(enable bool, logPath string) error {
+	// Acquire lock to prevent multiple instances
+	lockFile, err := acquireLock()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		lockFile.Close()
+	}()
+
 	t := NewMessagesTUI()
 	t.debug = enable
 	if enable {
@@ -85,6 +130,16 @@ func RunWithDebug(enable bool, logPath string) error {
 
 // Run starts the TUI application.
 func Run() error {
+	// Acquire lock to prevent multiple instances
+	lockFile, err := acquireLock()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		lockFile.Close()
+	}()
+
 	tui := NewMessagesTUI()
 	return tui.run()
 }
@@ -523,20 +578,86 @@ func (t *MessagesTUI) sendMessage(text string) {
 }
 
 func (t *MessagesTUI) refresh() {
-	t.app.QueueUpdateDraw(func() {
-		t.setStatus("🔄 Refreshing...")
-	})
+	// Prevent concurrent refreshes
+	if !t.refreshing.CompareAndSwap(false, true) {
+		return
+	}
+
+	// Set status directly - we're on the main event loop thread
+	t.setStatus("🔄 Refreshing...")
 
 	// Run refresh in goroutine to avoid blocking UI
 	go func() {
-		convs := t.watcher.GetConversations(DefaultConversationLimit)
+		defer t.refreshing.Store(false)
+
+		// Use channels to fetch data with timeout
+		type convResult struct {
+			convs []watcher.Conversation
+		}
+		type msgResult struct {
+			msgs []watcher.Message
+		}
+
+		convCh := make(chan convResult, 1)
+		go func() {
+			convCh <- convResult{convs: t.watcher.GetConversations(DefaultConversationLimit)}
+		}()
+
+		// Wait for conversations with timeout
+		var convs []watcher.Conversation
+		select {
+		case res := <-convCh:
+			convs = res.convs
+		case <-time.After(5 * time.Second):
+			t.app.QueueUpdateDraw(func() {
+				t.setStatus("⚠️ Refresh timeout - database may be busy")
+			})
+			return
+		}
 
 		t.mu.Lock()
 		t.conversations = convs
 		chatID := t.selectedChatID
 		t.mu.Unlock()
 
+		// Fetch messages before updating UI (if we have a selected chat)
+		var msgs []watcher.Message
+		var chatName string
+		if chatID > 0 {
+			msgCh := make(chan msgResult, 1)
+			go func() {
+				msgCh <- msgResult{msgs: t.watcher.GetMessages(chatID, DefaultMessageLimit)}
+			}()
+
+			// Wait for messages with timeout
+			select {
+			case res := <-msgCh:
+				msgs = res.msgs
+			case <-time.After(5 * time.Second):
+				t.app.QueueUpdateDraw(func() {
+					t.setStatus("⚠️ Message load timeout - database may be busy")
+				})
+				return
+			}
+
+			t.mu.Lock()
+			t.messages = msgs
+			t.mu.Unlock()
+
+			// Find conversation name
+			t.mu.RLock()
+			for _, conv := range t.conversations {
+				if conv.ChatID == chatID {
+					chatName = conv.DisplayName
+					break
+				}
+			}
+			t.mu.RUnlock()
+		}
+
+		// Single QueueUpdateDraw call to update all UI elements atomically
 		t.app.QueueUpdateDraw(func() {
+			// Update conversation list
 			t.convList.Clear()
 			for _, conv := range convs {
 				name := conv.DisplayName
@@ -551,27 +672,9 @@ func (t *MessagesTUI) refresh() {
 
 				t.convList.AddItem(name, secondary, 0, nil)
 			}
-		})
 
-		if chatID > 0 {
-			msgs := t.watcher.GetMessages(chatID, DefaultMessageLimit)
-
-			t.mu.Lock()
-			t.messages = msgs
-			t.mu.Unlock()
-
-			// Find conversation name
-			var chatName string
-			t.mu.RLock()
-			for _, conv := range t.conversations {
-				if conv.ChatID == chatID {
-					chatName = conv.DisplayName
-					break
-				}
-			}
-			t.mu.RUnlock()
-
-			t.app.QueueUpdateDraw(func() {
+			// Update messages if we have a selected chat
+			if chatID > 0 && msgs != nil {
 				t.msgView.Clear()
 				t.msgView.SetTitle(fmt.Sprintf(" %s ", chatName))
 
@@ -590,13 +693,10 @@ func (t *MessagesTUI) refresh() {
 				}
 				t.msgView.SetText(builder.String())
 				t.msgView.ScrollToEnd()
-				t.setStatus("✓ Refreshed!")
-			})
-		} else {
-			t.app.QueueUpdateDraw(func() {
-				t.setStatus("✓ Refreshed!")
-			})
-		}
+			}
+
+			t.setStatus("✓ Refreshed!")
+		})
 	}()
 }
 

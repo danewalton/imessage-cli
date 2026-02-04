@@ -53,9 +53,21 @@ func GetConnection() (*sql.DB, error) {
 		return nil, fmt.Errorf("iMessage database not found at %s. Make sure you're running this on macOS with Messages configured", dbPath)
 	}
 
-	// Connect in read-only mode
-	connStr := fmt.Sprintf("file:%s?mode=ro", dbPath)
-	return sql.Open("sqlite3", connStr)
+	// Connect in read-only mode with busy timeout to avoid locking issues
+	// _busy_timeout=3000 waits up to 3 seconds if database is locked
+	// _journal_mode=WAL enables write-ahead logging for better concurrent access
+	connStr := fmt.Sprintf("file:%s?mode=ro&_busy_timeout=3000&_journal_mode=WAL", dbPath)
+	db, err := sql.Open("sqlite3", connStr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Set connection pool settings to avoid holding connections too long
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(30 * time.Second)
+
+	return db, nil
 }
 
 // AppleTimeToTime converts Apple's timestamp format to Go time.Time.
