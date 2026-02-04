@@ -7,12 +7,22 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/danewalton/imessage-cli/internal/sender"
 	"github.com/danewalton/imessage-cli/internal/watcher"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
+)
+
+// UI constants
+const (
+	DefaultConversationLimit = 50
+	DefaultMessageLimit      = 100
+	MaxDisplayNameLength     = 30
+	MaxSenderNameLength      = 15
+	MessageRefreshDelay      = 500 * time.Millisecond
 )
 
 // MessagesTUI is the main TUI application.
@@ -32,6 +42,8 @@ type MessagesTUI struct {
 	selectedChatIdx int
 
 	mu sync.RWMutex
+	// sendingMessage tracks whether a message send is in progress
+	sendingMessage atomic.Bool
 	// logging
 	logger  *log.Logger
 	logFile *os.File
@@ -313,7 +325,7 @@ func (t *MessagesTUI) logf(format string, v ...interface{}) {
 
 // loadInitialData loads data synchronously before the app starts
 func (t *MessagesTUI) loadInitialData() {
-	convs := t.watcher.GetConversations(50)
+	convs := t.watcher.GetConversations(DefaultConversationLimit)
 
 	if t.logger != nil {
 		t.logf("loadInitialData: got %d conversations", len(convs))
@@ -327,8 +339,8 @@ func (t *MessagesTUI) loadInitialData() {
 	t.convList.Clear()
 	for _, conv := range convs {
 		name := conv.DisplayName
-		if len(name) > 30 {
-			name = name[:27] + "..."
+		if len(name) > MaxDisplayNameLength {
+			name = name[:MaxDisplayNameLength-3] + "..."
 		}
 
 		secondary := t.formatTime(conv.LastMessageDate)
@@ -342,7 +354,7 @@ func (t *MessagesTUI) loadInitialData() {
 	// Load first conversation's messages
 	if len(convs) > 0 {
 		t.selectedChatID = convs[0].ChatID
-		msgs := t.watcher.GetMessages(convs[0].ChatID, 100)
+		msgs := t.watcher.GetMessages(convs[0].ChatID, DefaultMessageLimit)
 
 		t.mu.Lock()
 		t.messages = msgs
@@ -350,25 +362,31 @@ func (t *MessagesTUI) loadInitialData() {
 
 		t.msgView.SetTitle(fmt.Sprintf(" %s ", convs[0].DisplayName))
 
-		var builder strings.Builder
-		for _, msg := range msgs {
-			timeStr := t.formatTime(msg.Date)
-			if msg.IsFromMe {
-				builder.WriteString(fmt.Sprintf("[green][%s] Me:[-] %s\n", timeStr, msg.Text))
-			} else {
-				sender := msg.Sender
-				if len(sender) > 15 {
-					sender = sender[:12] + "..."
+		if msgs == nil {
+			t.msgView.SetText("[yellow]No messages or unable to load messages[-]")
+		} else {
+			var builder strings.Builder
+			for _, msg := range msgs {
+				timeStr := t.formatTime(msg.Date)
+				if msg.IsFromMe {
+					builder.WriteString(fmt.Sprintf("[green][%s] Me:[-] %s\n", timeStr, msg.Text))
+				} else {
+					sender := msg.Sender
+					if len(sender) > MaxSenderNameLength {
+						sender = sender[:MaxSenderNameLength-3] + "..."
+					}
+					builder.WriteString(fmt.Sprintf("[cyan][%s] %s:[-] %s\n", timeStr, sender, msg.Text))
 				}
-				builder.WriteString(fmt.Sprintf("[cyan][%s] %s:[-] %s\n", timeStr, sender, msg.Text))
 			}
+			t.msgView.SetText(builder.String())
 		}
-		t.msgView.SetText(builder.String())
+	} else {
+		t.msgView.SetText("[yellow]No conversations found. Make sure Messages is configured and Full Disk Access is granted.[-]")
 	}
 }
 
 func (t *MessagesTUI) loadConversations() {
-	convs := t.watcher.GetConversations(50)
+	convs := t.watcher.GetConversations(DefaultConversationLimit)
 
 	t.mu.Lock()
 	t.conversations = convs
@@ -378,8 +396,8 @@ func (t *MessagesTUI) loadConversations() {
 		t.convList.Clear()
 		for _, conv := range convs {
 			name := conv.DisplayName
-			if len(name) > 30 {
-				name = name[:27] + "..."
+			if len(name) > MaxDisplayNameLength {
+				name = name[:MaxDisplayNameLength-3] + "..."
 			}
 
 			secondary := t.formatTime(conv.LastMessageDate)
@@ -399,7 +417,12 @@ func (t *MessagesTUI) loadConversations() {
 }
 
 func (t *MessagesTUI) loadMessages(chatID int64) {
-	msgs := t.watcher.GetMessages(chatID, 100)
+	// Show loading indicator
+	t.app.QueueUpdateDraw(func() {
+		t.msgView.SetText("[yellow]Loading messages...[-]")
+	})
+
+	msgs := t.watcher.GetMessages(chatID, DefaultMessageLimit)
 
 	t.mu.Lock()
 	t.messages = msgs
@@ -421,6 +444,11 @@ func (t *MessagesTUI) loadMessages(chatID int64) {
 		t.msgView.Clear()
 		t.msgView.SetTitle(fmt.Sprintf(" %s ", chatName))
 
+		if msgs == nil {
+			t.msgView.SetText("[red]Unable to load messages[-]")
+			return
+		}
+
 		var builder strings.Builder
 		for _, msg := range msgs {
 			timeStr := t.formatTime(msg.Date)
@@ -429,8 +457,8 @@ func (t *MessagesTUI) loadMessages(chatID int64) {
 				builder.WriteString(fmt.Sprintf("[green][%s] Me:[-] %s\n", timeStr, msg.Text))
 			} else {
 				sender := msg.Sender
-				if len(sender) > 15 {
-					sender = sender[:12] + "..."
+				if len(sender) > MaxSenderNameLength {
+					sender = sender[:MaxSenderNameLength-3] + "..."
 				}
 				builder.WriteString(fmt.Sprintf("[cyan][%s] %s:[-] %s\n", timeStr, sender, msg.Text))
 			}
@@ -441,6 +469,14 @@ func (t *MessagesTUI) loadMessages(chatID int64) {
 }
 
 func (t *MessagesTUI) sendMessage(text string) {
+	// Prevent multiple concurrent sends
+	if !t.sendingMessage.CompareAndSwap(false, true) {
+		t.app.QueueUpdateDraw(func() {
+			t.setStatus("⏳ Already sending a message...")
+		})
+		return
+	}
+
 	t.mu.RLock()
 	chatID := t.selectedChatID
 	var chatIdent string
@@ -453,35 +489,115 @@ func (t *MessagesTUI) sendMessage(text string) {
 	t.mu.RUnlock()
 
 	if chatIdent == "" {
-		t.setStatus("Error: No conversation selected")
+		t.sendingMessage.Store(false)
+		t.app.QueueUpdateDraw(func() {
+			t.setStatus("Error: No conversation selected")
+		})
 		return
 	}
 
-	err := sender.SendMessage(chatIdent, text)
-	if err != nil {
-		t.setStatus(fmt.Sprintf("Error: %v", err))
-	} else {
-		t.setStatus("✓ Message sent!")
-		// Refresh messages after a short delay
-		go func() {
-			time.Sleep(500 * time.Millisecond)
+	// Run async to avoid blocking UI (AppleScript can take up to 30s)
+	go func() {
+		defer t.sendingMessage.Store(false)
+
+		t.app.QueueUpdateDraw(func() {
+			t.setStatus("📤 Sending...")
+		})
+
+		err := sender.SendMessage(chatIdent, text)
+		if err != nil {
+			t.app.QueueUpdateDraw(func() {
+				t.setStatus(fmt.Sprintf("❌ Error: %v", err))
+				// Restore the message text so user can retry
+				t.inputField.SetText(text)
+			})
+		} else {
+			t.app.QueueUpdateDraw(func() {
+				t.setStatus("✓ Message sent!")
+			})
+			// Refresh messages after a short delay
+			time.Sleep(MessageRefreshDelay)
 			t.loadMessages(chatID)
-		}()
-	}
+		}
+	}()
 }
 
 func (t *MessagesTUI) refresh() {
-	t.setStatus("🔄 Refreshing...")
-	t.loadConversations()
+	t.app.QueueUpdateDraw(func() {
+		t.setStatus("🔄 Refreshing...")
+	})
 
-	t.mu.RLock()
-	chatID := t.selectedChatID
-	t.mu.RUnlock()
+	// Run refresh in goroutine to avoid blocking UI
+	go func() {
+		convs := t.watcher.GetConversations(DefaultConversationLimit)
 
-	if chatID > 0 {
-		t.loadMessages(chatID)
-	}
-	t.setStatus("✓ Refreshed!")
+		t.mu.Lock()
+		t.conversations = convs
+		chatID := t.selectedChatID
+		t.mu.Unlock()
+
+		t.app.QueueUpdateDraw(func() {
+			t.convList.Clear()
+			for _, conv := range convs {
+				name := conv.DisplayName
+				if len(name) > MaxDisplayNameLength {
+					name = name[:MaxDisplayNameLength-3] + "..."
+				}
+
+				secondary := t.formatTime(conv.LastMessageDate)
+				if conv.UnreadCount > 0 {
+					name = fmt.Sprintf("(%d) %s", conv.UnreadCount, name)
+				}
+
+				t.convList.AddItem(name, secondary, 0, nil)
+			}
+		})
+
+		if chatID > 0 {
+			msgs := t.watcher.GetMessages(chatID, DefaultMessageLimit)
+
+			t.mu.Lock()
+			t.messages = msgs
+			t.mu.Unlock()
+
+			// Find conversation name
+			var chatName string
+			t.mu.RLock()
+			for _, conv := range t.conversations {
+				if conv.ChatID == chatID {
+					chatName = conv.DisplayName
+					break
+				}
+			}
+			t.mu.RUnlock()
+
+			t.app.QueueUpdateDraw(func() {
+				t.msgView.Clear()
+				t.msgView.SetTitle(fmt.Sprintf(" %s ", chatName))
+
+				var builder strings.Builder
+				for _, msg := range msgs {
+					timeStr := t.formatTime(msg.Date)
+					if msg.IsFromMe {
+						builder.WriteString(fmt.Sprintf("[green][%s] Me:[-] %s\n", timeStr, msg.Text))
+					} else {
+						sender := msg.Sender
+						if len(sender) > MaxSenderNameLength {
+							sender = sender[:MaxSenderNameLength-3] + "..."
+						}
+						builder.WriteString(fmt.Sprintf("[cyan][%s] %s:[-] %s\n", timeStr, sender, msg.Text))
+					}
+				}
+				t.msgView.SetText(builder.String())
+				t.msgView.ScrollToEnd()
+				t.setStatus("✓ Refreshed!")
+			})
+		} else {
+			t.app.QueueUpdateDraw(func() {
+				t.setStatus("✓ Refreshed!")
+			})
+		}
+	}()
 }
 
 func (t *MessagesTUI) onNewMessages(msgs []watcher.Message) {
@@ -523,8 +639,8 @@ func (t *MessagesTUI) onConversationsUpdated(convs []watcher.Conversation) {
 		t.convList.Clear()
 		for _, conv := range convs {
 			name := conv.DisplayName
-			if len(name) > 30 {
-				name = name[:27] + "..."
+			if len(name) > MaxDisplayNameLength {
+				name = name[:MaxDisplayNameLength-3] + "..."
 			}
 
 			secondary := t.formatTime(conv.LastMessageDate)

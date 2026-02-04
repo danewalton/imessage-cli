@@ -3,11 +3,19 @@ package watcher
 
 import (
 	"database/sql"
+	"log"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/danewalton/imessage-cli/internal/database"
+)
+
+// Watcher constants
+const (
+	DefaultPollInterval      = 500 * time.Millisecond
+	DefaultConversationLimit = 50
 )
 
 // Message represents an iMessage for the watcher.
@@ -48,14 +56,16 @@ type ErrorCallback func(error)
 type MessageWatcher struct {
 	pollInterval          time.Duration
 	running               bool
-	lastMessageID         int64
-	lastMtime             int64
+	lastMessageID         atomic.Int64
+	lastMtime             atomic.Int64
 	messageCallbacks      []MessageCallback
 	conversationCallbacks []ConversationCallback
 	errorCallbacks        []ErrorCallback
 	mu                    sync.RWMutex
 	stopCh                chan struct{}
 	wg                    sync.WaitGroup
+	// logger for debugging callback issues
+	logger *log.Logger
 }
 
 // NewMessageWatcher creates a new MessageWatcher.
@@ -162,6 +172,7 @@ func (w *MessageWatcher) GetMessages(chatID int64, limit int) []Message {
 func (w *MessageWatcher) GetNewMessages(sinceID int64) []Message {
 	db, err := database.GetConnection()
 	if err != nil {
+		w.notifyError(err)
 		return nil
 	}
 	defer db.Close()
@@ -253,47 +264,59 @@ func (w *MessageWatcher) pollLoop() {
 func (w *MessageWatcher) poll() {
 	// Check if database has been modified
 	currentMtime := w.getDBMtime()
+	lastMtime := w.lastMtime.Load()
 
-	if currentMtime > w.lastMtime {
-		w.lastMtime = currentMtime
+	if currentMtime > lastMtime {
+		w.lastMtime.Store(currentMtime)
 
 		// Check for new messages
 		currentMaxID := w.getLastMessageID()
+		lastID := w.lastMessageID.Load()
 
-		if currentMaxID > w.lastMessageID {
-			newMessages := w.GetNewMessages(w.lastMessageID)
-			w.lastMessageID = currentMaxID
+		if currentMaxID > lastID {
+			newMessages := w.GetNewMessages(lastID)
+			w.lastMessageID.Store(currentMaxID)
 
 			if len(newMessages) > 0 {
 				w.mu.RLock()
-				for _, cb := range w.messageCallbacks {
-					go func(callback MessageCallback) {
+				callbacks := make([]MessageCallback, len(w.messageCallbacks))
+				copy(callbacks, w.messageCallbacks)
+				w.mu.RUnlock()
+
+				for _, cb := range callbacks {
+					go func(callback MessageCallback, msgs []Message) {
 						defer func() {
 							if r := recover(); r != nil {
-								// Ignore panics in callbacks
+								if w.logger != nil {
+									w.logger.Printf("panic in message callback: %v", r)
+								}
 							}
 						}()
-						callback(newMessages)
-					}(cb)
+						callback(msgs)
+					}(cb, newMessages)
 				}
-				w.mu.RUnlock()
 			}
 		}
 
 		// Update conversations
-		conversations := w.GetConversations(50)
+		conversations := w.GetConversations(DefaultConversationLimit)
 		w.mu.RLock()
-		for _, cb := range w.conversationCallbacks {
-			go func(callback ConversationCallback) {
+		callbacks := make([]ConversationCallback, len(w.conversationCallbacks))
+		copy(callbacks, w.conversationCallbacks)
+		w.mu.RUnlock()
+
+		for _, cb := range callbacks {
+			go func(callback ConversationCallback, convs []Conversation) {
 				defer func() {
 					if r := recover(); r != nil {
-						// Ignore panics in callbacks
+						if w.logger != nil {
+							w.logger.Printf("panic in conversation callback: %v", r)
+						}
 					}
 				}()
-				callback(conversations)
-			}(cb)
+				callback(convs)
+			}(cb, conversations)
 		}
-		w.mu.RUnlock()
 	}
 }
 
@@ -321,11 +344,9 @@ func (w *MessageWatcher) Start() {
 	// Start poll loop in a goroutine; perform initial DB checks there to avoid blocking caller
 	w.wg.Add(1)
 	go func() {
-		// Initialize last IDs / mtime inside goroutine
-		w.mu.Lock()
-		w.lastMessageID = w.getLastMessageID()
-		w.lastMtime = w.getDBMtime()
-		w.mu.Unlock()
+		// Initialize last IDs / mtime inside goroutine using atomic operations
+		w.lastMessageID.Store(w.getLastMessageID())
+		w.lastMtime.Store(w.getDBMtime())
 
 		w.pollLoop()
 	}()

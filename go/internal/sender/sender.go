@@ -153,7 +153,15 @@ func StartMessagesApp() bool {
 }
 
 func escapeForAppleScript(s string) string {
+	// Escape backslashes first (order matters)
 	s = strings.ReplaceAll(s, "\\", "\\\\")
+	// Escape double quotes
 	s = strings.ReplaceAll(s, "\"", "\\\"")
+	// Replace newlines with AppleScript line breaks
+	s = strings.ReplaceAll(s, "\n", "\" & return & \"")
+	// Replace carriage returns
+	s = strings.ReplaceAll(s, "\r", "")
+	// Replace tabs with spaces
+	s = strings.ReplaceAll(s, "\t", "    ")
 	return s
 }
