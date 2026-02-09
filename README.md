@@ -1,219 +1,167 @@
 # iMessage CLI
 
-A command-line interface for reading and responding to iMessages on macOS. Perfect for SSH sessions when you want to check and reply to messages without leaving the terminal.
+A command-line tool for reading and sending iMessages on macOS.
 
 ## Features
 
-- �️ **Interactive TUI** - Full-screen interface with real-time message updates
-- 📋 **List conversations** - View recent chats with timestamps
-- 📖 **Read messages** - View message history for any conversation
-- 📤 **Send messages** - Reply to contacts directly from the CLI
-- 💬 **Interactive chat mode** - Real-time conversation interface
-- 🔍 **Search messages** - Find messages containing specific text
-- 📊 **Status check** - Verify setup and view statistics
-- 🔄 **Live updates** - Database watcher for real-time notifications
+- **List conversations** - View recent iMessage conversations
+- **Read messages** - Read messages from any conversation
+- **Send messages** - Send iMessages from the command line
+- **Interactive chat** - Real-time chat mode with a contact
+- **Search** - Search through your message history
+- **TUI** - Full terminal user interface with live updates
 
 ## Requirements
 
-- macOS (tested on Monterey, Ventura, Sonoma, and Sequoia)
-- Python 3.8 or later
-- Messages app configured with an iCloud account
-- **Full Disk Access** permission for Terminal (or your SSH client)
+- macOS (uses the Messages app and iMessage database)
+- Go 1.21 or later
+- Full Disk Access permission for Terminal/your terminal emulator
+
+## Building
+
+```bash
+cd go
+go mod download
+go build -o imessage ./cmd/imessage
+```
 
 ## Installation
 
-### Quick Start (No Installation)
-
 ```bash
-# Clone or download the repository
-git clone https://github.com/yourusername/imessage-cli.git
-cd imessage-cli
+# Build and install to your GOPATH/bin
+go install ./cmd/imessage
 
-# Make the script executable
-chmod +x imessage
-
-# Run directly
-./imessage list
-```
-
-### Install as Package
-
-```bash
-# Install in development mode
-pip install -e .
-
-# Or install directly
-pip install .
-
-# Now you can run from anywhere
-imessage list
+# Or build locally
+go build -o imessage ./cmd/imessage
 ```
 
 ## Usage
 
-### Interactive TUI (Recommended for SSH)
-
-The TUI provides a full-screen, real-time interface that automatically updates when new messages arrive:
+### List recent conversations
 
 ```bash
-# Launch the TUI
-imessage tui
-
-# Aliases
-imessage ui
-imessage watch
-```
-
-**TUI Keyboard Controls:**
-
-| Key | Action |
-|-----|--------|
-| `↑/↓` or `j/k` | Navigate conversations/scroll messages |
-| `←/→` or `h/l` | Switch between panels |
-| `Tab` | Switch focus between panels |
-| `Enter` | Select conversation |
-| `i` | Enter input mode to type a message |
-| `Escape` | Exit input mode |
-| `r` | Refresh messages |
-| `g/G` | Go to top/bottom of messages |
-| `PgUp/PgDn` | Scroll messages by page |
-| `q` | Quit |
-
-### List Conversations
-
-```bash
-# Show recent conversations
 imessage list
-
-# Show more conversations
-imessage list -n 50
-
-# Short aliases work too
 imessage ls
 imessage l
 ```
 
-### Read Messages
+### Read messages from a conversation
 
 ```bash
-# Read messages from conversation #1 (from the list)
+# By conversation number from list
 imessage read 1
 
-# Read messages from a specific phone number
+# By phone number
 imessage read "+1234567890"
 
-# Read more messages
-imessage read 1 -n 100
-
-# Aliases
-imessage r 1
-imessage view 1
+# Specify number of messages
+imessage read 1 -n 50
 ```
 
-### Send Messages
+### Send a message
 
 ```bash
-# Send a message (with confirmation prompt)
-imessage send "+1234567890" "Hello from the terminal!"
+imessage send "+1234567890" "Hello from the command line!"
 
 # Skip confirmation
-imessage send "+1234567890" "Quick message" -y
-
-# Alias
-imessage s "+1234567890" "Hi there"
+imessage send "+1234567890" "Hi" -y
 ```
 
-### Interactive Chat Mode
+### Interactive chat mode
 
 ```bash
-# Start interactive chat with conversation #1
 imessage chat 1
-
-# Or with a phone number
 imessage chat "+1234567890"
-
-# In chat mode:
-#   - Type messages and press Enter to send
-#   - Type 'r' or 'refresh' to reload messages
-#   - Type 'quit' or Ctrl+C to exit
 ```
 
-### Search Messages
+### Search messages
 
 ```bash
-# Search for messages containing text
-imessage search "meeting tomorrow"
-
-# Limit results
-imessage search "lunch" -n 10
-
-# Aliases
-imessage find "project"
-imessage grep "hello"
+imessage search "meeting"
+imessage search "project" -n 50
 ```
 
-### Check Status
+### Launch TUI (Terminal User Interface)
 
 ```bash
-# View status and statistics
+imessage tui
+imessage ui
+imessage watch
+```
+
+### Check status
+
+```bash
 imessage status
 ```
 
-## Permissions Setup
+## TUI Controls
 
-### Grant Full Disk Access
+| Key | Action |
+|-----|--------|
+| `↑/↓` or `j/k` | Navigate/scroll |
+| `Enter` | Select conversation |
+| `Tab` | Switch between panels |
+| `h/←` | Go back to conversations |
+| `l/→` | Go to messages |
+| `i` | Start typing a message |
+| `r` | Refresh |
+| `g` | Go to top (messages) |
+| `G` | Go to bottom (messages) |
+| `q` | Quit |
 
-For the CLI to read the Messages database, you need to grant Full Disk Access:
+## Permissions
 
-1. Open **System Preferences** (or **System Settings** on newer macOS)
-2. Go to **Privacy & Security** → **Full Disk Access**
-3. Click the lock to make changes
-4. Add **Terminal** (or iTerm, or your SSH client)
-5. Restart Terminal
+This tool requires access to:
 
-### For SSH Access
+1. **iMessage Database** (`~/Library/Messages/chat.db`) - Grant Full Disk Access to your terminal
+2. **Contacts Database** (`~/Library/Application Support/AddressBook/`) - For resolving contact names
+3. **Messages App** - Via AppleScript for sending messages
 
-If you're SSHing into your Mac, you'll need to grant Full Disk Access to the SSH daemon:
+To grant Full Disk Access:
+1. Open System Preferences → Security & Privacy → Privacy
+2. Select "Full Disk Access"
+3. Add your terminal application (Terminal.app, iTerm2, etc.)
 
-1. Add `/usr/sbin/sshd` to Full Disk Access
-2. Alternatively, if using a custom SSH server, add that instead
+## Project Structure
 
-## Troubleshooting
+```
+go/
+├── cmd/
+│   └── imessage/
+│       └── main.go           # Entry point
+├── internal/
+│   ├── cli/
+│   │   └── cli.go            # CLI commands
+│   ├── database/
+│   │   ├── database.go       # iMessage database operations
+│   │   └── contacts.go       # Contact resolution
+│   ├── sender/
+│   │   └── sender.go         # AppleScript message sending
+│   ├── tui/
+│   │   └── tui.go            # Terminal user interface
+│   └── watcher/
+│       └── watcher.go        # Real-time message watching
+├── go.mod
+├── go.sum
+└── README.md
+```
 
-### "iMessage database not found"
+## Dependencies
 
-- Make sure Messages is configured and you've sent/received at least one message
-- Check that Full Disk Access is granted
+- [spf13/cobra](https://github.com/spf13/cobra) - CLI framework
+- [mattn/go-sqlite3](https://github.com/mattn/go-sqlite3) - SQLite driver
+- [rivo/tview](https://github.com/rivo/tview) - TUI framework
+- [gdamore/tcell](https://github.com/gdamore/tcell) - Terminal handling
 
-### "Failed to send message"
+## Differences from Python Version
 
-- Ensure Messages app is running (the CLI will try to start it)
-- Verify the recipient is a valid phone number or email
-- Check that your iCloud account is signed in to Messages
-
-### Messages not showing
-
-- The database might take a moment to sync
-- Try running `imessage status` to verify database access
-
-### Permission denied errors
-
-- Double-check Full Disk Access permissions
-- Try running from a fresh Terminal session after granting permissions
-
-## How It Works
-
-- **Reading**: The CLI reads directly from the Messages SQLite database located at `~/Library/Messages/chat.db`
-- **Sending**: Messages are sent using AppleScript to control the Messages app
-
-## Privacy Note
-
-This tool only accesses your local Messages database. No data is sent to external servers. All message sending goes through Apple's official Messages app.
+This Go version is a complete rewrite with:
+- Single binary distribution (no Python dependency)
+- Faster startup time
+- Native concurrency with goroutines
+- Uses tview instead of curses for the TUI
 
 ## License
 
-MIT License - see LICENSE file for details.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+Same license as the parent project.
