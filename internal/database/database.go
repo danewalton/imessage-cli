@@ -8,10 +8,17 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
 	_ "github.com/mattn/go-sqlite3"
+)
+
+var (
+	sharedDB   *sql.DB
+	dbOnce     sync.Once
+	dbInitErr  error
 )
 
 // Message represents an iMessage.
@@ -46,28 +53,64 @@ func GetDBPath() string {
 	return filepath.Join(home, "Library", "Messages", "chat.db")
 }
 
-// GetConnection creates a read-only connection to the iMessage database.
+// initDB initializes the shared database connection pool.
+func initDB() {
+	dbOnce.Do(func() {
+		dbPath := GetDBPath()
+		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+			dbInitErr = fmt.Errorf("iMessage database not found at %s. Make sure you're running this on macOS with Messages configured", dbPath)
+			return
+		}
+
+		// Connect in read-only mode with busy timeout to avoid locking issues
+		// _busy_timeout=3000 waits up to 3 seconds if database is locked
+		// _journal_mode=WAL enables write-ahead logging for better concurrent access
+		connStr := fmt.Sprintf("file:%s?mode=ro&_busy_timeout=3000&_journal_mode=WAL", dbPath)
+		db, err := sql.Open("sqlite3", connStr)
+		if err != nil {
+			dbInitErr = err
+			return
+		}
+
+		// Pool settings for a shared long-lived connection
+		db.SetMaxOpenConns(2)
+		db.SetMaxIdleConns(2)
+		db.SetConnMaxLifetime(5 * time.Minute)
+
+		// Verify the connection is usable
+		if err := db.Ping(); err != nil {
+			db.Close()
+			dbInitErr = fmt.Errorf("cannot connect to iMessage database: %w", err)
+			return
+		}
+
+		sharedDB = db
+	})
+}
+
+// DB returns the shared database connection pool.
+// The pool is lazily initialized on first call and reused for all subsequent queries.
+func DB() (*sql.DB, error) {
+	initDB()
+	if dbInitErr != nil {
+		return nil, dbInitErr
+	}
+	return sharedDB, nil
+}
+
+// CloseDB closes the shared database connection pool.
+// Call this during application shutdown for a clean exit.
+func CloseDB() {
+	if sharedDB != nil {
+		sharedDB.Close()
+		sharedDB = nil
+	}
+}
+
+// GetConnection creates a new standalone connection to the iMessage database.
+// Deprecated: Use DB() for the shared connection pool instead.
 func GetConnection() (*sql.DB, error) {
-	dbPath := GetDBPath()
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("iMessage database not found at %s. Make sure you're running this on macOS with Messages configured", dbPath)
-	}
-
-	// Connect in read-only mode with busy timeout to avoid locking issues
-	// _busy_timeout=3000 waits up to 3 seconds if database is locked
-	// _journal_mode=WAL enables write-ahead logging for better concurrent access
-	connStr := fmt.Sprintf("file:%s?mode=ro&_busy_timeout=3000&_journal_mode=WAL", dbPath)
-	db, err := sql.Open("sqlite3", connStr)
-	if err != nil {
-		return nil, err
-	}
-
-	// Set connection pool settings to avoid holding connections too long
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-	db.SetConnMaxLifetime(30 * time.Second)
-
-	return db, nil
+	return DB()
 }
 
 // AppleTimeToTime converts Apple's timestamp format to Go time.Time.
@@ -193,11 +236,10 @@ func cleanPrintable(s string) string {
 
 // GetConversations retrieves a list of recent conversations.
 func GetConversations(limit int) ([]Conversation, error) {
-	db, err := GetConnection()
+	db, err := DB()
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
 
 	query := `
 		SELECT 
@@ -263,11 +305,10 @@ func GetConversations(limit int) ([]Conversation, error) {
 
 // GetMessages retrieves messages from a specific conversation.
 func GetMessages(chatID int64, chatIdentifier string, limit int) ([]Message, error) {
-	db, err := GetConnection()
+	db, err := DB()
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
 
 	var whereClause string
 	var whereParam interface{}
@@ -363,11 +404,10 @@ func GetMessages(chatID int64, chatIdentifier string, limit int) ([]Message, err
 
 // SearchMessages searches for messages containing the given text.
 func SearchMessages(query string, limit int) ([]Message, error) {
-	db, err := GetConnection()
+	db, err := DB()
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
 
 	sqlQuery := `
 		SELECT 
@@ -438,11 +478,10 @@ func SearchMessages(query string, limit int) ([]Message, error) {
 
 // GetUnreadCount returns the count of unread messages.
 func GetUnreadCount() (int, error) {
-	db, err := GetConnection()
+	db, err := DB()
 	if err != nil {
 		return 0, err
 	}
-	defer db.Close()
 
 	var count int
 	err = db.QueryRow(`
@@ -456,11 +495,10 @@ func GetUnreadCount() (int, error) {
 
 // GetContactByIdentifier looks up a contact by phone number or email.
 func GetContactByIdentifier(identifier string) (*Conversation, error) {
-	db, err := GetConnection()
+	db, err := DB()
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
 
 	// Normalize identifier
 	normalized := normalizeIdentifier(identifier)

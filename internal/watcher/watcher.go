@@ -98,11 +98,10 @@ func (w *MessageWatcher) OnError(callback ErrorCallback) {
 }
 
 func (w *MessageWatcher) getLastMessageID() int64 {
-	db, err := database.GetConnection()
+	db, err := database.DB()
 	if err != nil {
 		return 0
 	}
-	defer db.Close()
 
 	var maxID sql.NullInt64
 	err = db.QueryRow("SELECT MAX(ROWID) FROM message").Scan(&maxID)
@@ -184,12 +183,11 @@ func (w *MessageWatcher) GetMessages(chatID int64, limit int) []Message {
 
 // GetNewMessages returns messages newer than the given ID.
 func (w *MessageWatcher) GetNewMessages(sinceID int64) []Message {
-	db, err := database.GetConnection()
+	db, err := database.DB()
 	if err != nil {
 		w.notifyError(err)
 		return nil
 	}
-	defer db.Close()
 
 	query := `
 		SELECT 
