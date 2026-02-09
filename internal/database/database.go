@@ -21,18 +21,30 @@ var (
 	dbInitErr  error
 )
 
+// Attachment represents a file attachment on an iMessage.
+type Attachment struct {
+	AttachmentID int64
+	Filename     string // original filename
+	FilePath     string // full path on disk (~ expanded)
+	MIMEType     string
+	UTI          string // e.g. public.jpeg, public.heic
+	TotalBytes   int64
+	IsImage      bool
+}
+
 // Message represents an iMessage.
 type Message struct {
-	MessageID int64
-	Text      string
-	Date      *time.Time
-	IsFromMe  bool
-	IsRead    bool
-	Service   string
-	Sender    string
-	ChatID    int64
-	ChatIdent string
-	ChatName  string
+	MessageID   int64
+	Text        string
+	Date        *time.Time
+	IsFromMe    bool
+	IsRead      bool
+	Service     string
+	Sender      string
+	ChatID      int64
+	ChatIdent   string
+	ChatName    string
+	Attachments []Attachment
 }
 
 // Conversation represents a chat/conversation.
@@ -399,6 +411,22 @@ func GetMessages(chatID int64, chatIdentifier string, limit int) ([]Message, err
 		messages[i], messages[j] = messages[j], messages[i]
 	}
 
+	// Batch-load attachments for all messages
+	if len(messages) > 0 {
+		msgIDs := make([]int64, len(messages))
+		for i, m := range messages {
+			msgIDs[i] = m.MessageID
+		}
+		attMap, err := GetAttachmentsForMessages(msgIDs)
+		if err == nil && attMap != nil {
+			for i := range messages {
+				if atts, ok := attMap[messages[i].MessageID]; ok {
+					messages[i].Attachments = atts
+				}
+			}
+		}
+	}
+
 	return messages, nil
 }
 
@@ -540,6 +568,143 @@ func normalizeIdentifier(identifier string) string {
 		}
 	}
 	return result.String()
+}
+
+// imageUTIs is the set of UTIs that represent image types.
+var imageUTIs = map[string]bool{
+	"public.jpeg":          true,
+	"public.png":           true,
+	"public.heic":          true,
+	"public.heif":          true,
+	"public.gif":           true,
+	"public.tiff":          true,
+	"public.bmp":           true,
+	"com.apple.icns":       true,
+	"public.webp":          true,
+	"com.compuserve.gif":   true,
+	"public.svg-image":     true,
+	"public.image":         true,
+}
+
+// isImageMIME checks if a MIME type represents an image.
+func isImageMIME(mime string) bool {
+	return strings.HasPrefix(mime, "image/")
+}
+
+// expandAttachmentPath expands ~ in iMessage attachment paths.
+func expandAttachmentPath(p string) string {
+	if strings.HasPrefix(p, "~") {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			p = filepath.Join(home, p[1:])
+		}
+	}
+	return p
+}
+
+// GetAttachmentsForMessage retrieves attachments for a single message ID.
+func GetAttachmentsForMessage(messageID int64) ([]Attachment, error) {
+	db, err := DB()
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := db.Query(`
+		SELECT
+			a.ROWID,
+			a.filename,
+			a.mime_type,
+			a.uti,
+			a.total_bytes
+		FROM attachment a
+		JOIN message_attachment_join maj ON a.ROWID = maj.attachment_id
+		WHERE maj.message_id = ?
+	`, messageID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var attachments []Attachment
+	for rows.Next() {
+		var att Attachment
+		var filename, mimeType, uti sql.NullString
+		var totalBytes sql.NullInt64
+
+		if err := rows.Scan(&att.AttachmentID, &filename, &mimeType, &uti, &totalBytes); err != nil {
+			continue
+		}
+		att.Filename = filepath.Base(filename.String)
+		att.FilePath = expandAttachmentPath(filename.String)
+		att.MIMEType = mimeType.String
+		att.UTI = uti.String
+		att.TotalBytes = totalBytes.Int64
+		att.IsImage = imageUTIs[att.UTI] || isImageMIME(att.MIMEType)
+
+		attachments = append(attachments, att)
+	}
+	return attachments, nil
+}
+
+// GetAttachmentsForMessages retrieves attachments for multiple message IDs in a
+// single query and returns them keyed by message ID.
+func GetAttachmentsForMessages(messageIDs []int64) (map[int64][]Attachment, error) {
+	if len(messageIDs) == 0 {
+		return nil, nil
+	}
+
+	db, err := DB()
+	if err != nil {
+		return nil, err
+	}
+
+	// Build placeholders
+	placeholders := make([]string, len(messageIDs))
+	args := make([]interface{}, len(messageIDs))
+	for i, id := range messageIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+
+	query := fmt.Sprintf(`
+		SELECT
+			maj.message_id,
+			a.ROWID,
+			a.filename,
+			a.mime_type,
+			a.uti,
+			a.total_bytes
+		FROM attachment a
+		JOIN message_attachment_join maj ON a.ROWID = maj.attachment_id
+		WHERE maj.message_id IN (%s)
+	`, strings.Join(placeholders, ","))
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[int64][]Attachment)
+	for rows.Next() {
+		var msgID int64
+		var att Attachment
+		var filename, mimeType, uti sql.NullString
+		var totalBytes sql.NullInt64
+
+		if err := rows.Scan(&msgID, &att.AttachmentID, &filename, &mimeType, &uti, &totalBytes); err != nil {
+			continue
+		}
+		att.Filename = filepath.Base(filename.String)
+		att.FilePath = expandAttachmentPath(filename.String)
+		att.MIMEType = mimeType.String
+		att.UTI = uti.String
+		att.TotalBytes = totalBytes.Int64
+		att.IsImage = imageUTIs[att.UTI] || isImageMIME(att.MIMEType)
+
+		result[msgID] = append(result[msgID], att)
+	}
+	return result, nil
 }
 
 // ResolveSender resolves a sender identifier to a display name.

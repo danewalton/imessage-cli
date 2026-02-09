@@ -18,6 +18,17 @@ const (
 	DefaultConversationLimit = 50
 )
 
+// Attachment mirrors database.Attachment for the watcher layer.
+type Attachment struct {
+	AttachmentID int64
+	Filename     string
+	FilePath     string
+	MIMEType     string
+	UTI          string
+	TotalBytes   int64
+	IsImage      bool
+}
+
 // Message represents an iMessage for the watcher.
 type Message struct {
 	MessageID      int64
@@ -29,6 +40,7 @@ type Message struct {
 	ChatID         int64
 	ChatIdentifier string
 	ChatName       string
+	Attachments    []Attachment
 }
 
 // Conversation represents a conversation for the watcher.
@@ -166,7 +178,7 @@ func (w *MessageWatcher) GetMessages(chatID int64, limit int) []Message {
 
 	var result []Message
 	for _, m := range msgs {
-		result = append(result, Message{
+		msg := Message{
 			MessageID:      m.MessageID,
 			Text:           m.Text,
 			Date:           m.Date,
@@ -176,7 +188,19 @@ func (w *MessageWatcher) GetMessages(chatID int64, limit int) []Message {
 			ChatID:         m.ChatID,
 			ChatIdentifier: m.ChatIdent,
 			ChatName:       m.ChatName,
-		})
+		}
+		for _, a := range m.Attachments {
+			msg.Attachments = append(msg.Attachments, Attachment{
+				AttachmentID: a.AttachmentID,
+				Filename:     a.Filename,
+				FilePath:     a.FilePath,
+				MIMEType:     a.MIMEType,
+				UTI:          a.UTI,
+				TotalBytes:   a.TotalBytes,
+				IsImage:      a.IsImage,
+			})
+		}
+		result = append(result, msg)
 	}
 	return result
 }

@@ -1,6 +1,6 @@
 module github.com/danewalton/imessage-cli
 
-go 1.21
+go 1.24.0
 
 require (
 	github.com/gdamore/tcell/v2 v2.7.0
@@ -16,7 +16,8 @@ require (
 	github.com/mattn/go-runewidth v0.0.15 // indirect
 	github.com/rivo/uniseg v0.4.3 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
+	golang.org/x/image v0.36.0 // indirect
 	golang.org/x/sys v0.15.0 // indirect
 	golang.org/x/term v0.15.0 // indirect
-	golang.org/x/text v0.14.0 // indirect
+	golang.org/x/text v0.34.0 // indirect
 )

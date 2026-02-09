@@ -26,6 +26,8 @@ const (
 	MaxSenderNameLength      = 15
 	MessageRefreshDelay      = 500 * time.Millisecond
 	LockFileName             = ".imessage-tui.lock"
+	PreviewMaxWidth          = 80
+	PreviewMaxHeight         = 30
 )
 
 // MessagesTUI is the main TUI application.
@@ -43,6 +45,7 @@ type MessagesTUI struct {
 	messages        []watcher.Message
 	selectedChatID  int64
 	selectedChatIdx int
+	previewModal    *tview.TextView
 
 	mu sync.RWMutex
 	// sendingMessage tracks whether a message send is in progress
@@ -255,7 +258,7 @@ func (t *MessagesTUI) setupCallbacks() {
 
 	t.convList.SetSelectedFunc(func(index int, mainText, secondaryText string, shortcut rune) {
 		t.app.SetFocus(t.msgView)
-		t.setStatus("[MSG] ↑↓:Scroll  h/←:Back  i:Input  r:Refresh  q:Quit")
+		t.setStatus("[MSG] ↑↓:Scroll  h/←:Back  i:Input  p:Preview  r:Refresh  q:Quit")
 	})
 
 	// Input handling
@@ -270,7 +273,7 @@ func (t *MessagesTUI) setupCallbacks() {
 			t.app.SetFocus(t.inputField)
 		} else if key == tcell.KeyEscape {
 			t.app.SetFocus(t.msgView)
-			t.setStatus("[MSG] ↑↓:Scroll  h/←:Back  i:Input  r:Refresh  q:Quit")
+			t.setStatus("[MSG] ↑↓:Scroll  h/←:Back  i:Input  p:Preview  r:Refresh  q:Quit")
 		}
 	})
 
@@ -295,7 +298,7 @@ func (t *MessagesTUI) setupCallbacks() {
 		case tcell.KeyTab:
 			if focused == t.convList {
 				t.app.SetFocus(t.msgView)
-				t.setStatus("[MSG] ↑↓:Scroll  h/←:Back  i:Input  r:Refresh  q:Quit")
+				t.setStatus("[MSG] ↑↓:Scroll  h/←:Back  i:Input  p:Preview  r:Refresh  q:Quit")
 			} else {
 				t.app.SetFocus(t.convList)
 				t.setStatus("[CONV] ↑↓:Nav  Enter:Select  Tab:Switch  i:Input  r:Refresh  q:Quit")
@@ -323,7 +326,7 @@ func (t *MessagesTUI) setupCallbacks() {
 			case 'l':
 				if focused == t.convList {
 					t.app.SetFocus(t.msgView)
-					t.setStatus("[MSG] ↑↓:Scroll  h/←:Back  i:Input  r:Refresh  q:Quit")
+					t.setStatus("[MSG] ↑↓:Scroll  h/←:Back  i:Input  p:Preview  r:Refresh  q:Quit")
 					return nil
 				}
 			case 'j':
@@ -350,6 +353,16 @@ func (t *MessagesTUI) setupCallbacks() {
 					t.msgView.ScrollToEnd()
 					return nil
 				}
+			case 'p':
+				if focused == t.msgView {
+					att := t.findNearestImageAttachment()
+					if att != nil {
+						t.showImagePreview(*att)
+					} else {
+						t.setStatus("No image attachments in this conversation")
+					}
+					return nil
+				}
 			}
 
 		case tcell.KeyLeft:
@@ -361,7 +374,7 @@ func (t *MessagesTUI) setupCallbacks() {
 		case tcell.KeyRight:
 			if focused == t.convList {
 				t.app.SetFocus(t.msgView)
-				t.setStatus("[MSG] ↑↓:Scroll  h/←:Back  i:Input  r:Refresh  q:Quit")
+				t.setStatus("[MSG] ↑↓:Scroll  h/←:Back  i:Input  p:Preview  r:Refresh  q:Quit")
 				return nil
 			}
 		}
@@ -431,16 +444,7 @@ func (t *MessagesTUI) loadInitialData() {
 		} else {
 			var builder strings.Builder
 			for _, msg := range msgs {
-				timeStr := t.formatTime(msg.Date)
-				if msg.IsFromMe {
-					builder.WriteString(fmt.Sprintf("[green][%s] Me:[-] %s\n", timeStr, msg.Text))
-				} else {
-					sender := msg.Sender
-					if len(sender) > MaxSenderNameLength {
-						sender = sender[:MaxSenderNameLength-3] + "..."
-					}
-					builder.WriteString(fmt.Sprintf("[cyan][%s] %s:[-] %s\n", timeStr, sender, msg.Text))
-				}
+				t.formatMessageLine(&builder, msg)
 			}
 			t.msgView.SetText(builder.String())
 		}
@@ -515,17 +519,7 @@ func (t *MessagesTUI) loadMessages(chatID int64) {
 
 		var builder strings.Builder
 		for _, msg := range msgs {
-			timeStr := t.formatTime(msg.Date)
-
-			if msg.IsFromMe {
-				builder.WriteString(fmt.Sprintf("[green][%s] Me:[-] %s\n", timeStr, msg.Text))
-			} else {
-				sender := msg.Sender
-				if len(sender) > MaxSenderNameLength {
-					sender = sender[:MaxSenderNameLength-3] + "..."
-				}
-				builder.WriteString(fmt.Sprintf("[cyan][%s] %s:[-] %s\n", timeStr, sender, msg.Text))
-			}
+			t.formatMessageLine(&builder, msg)
 		}
 		t.msgView.SetText(builder.String())
 		t.msgView.ScrollToEnd()
@@ -715,16 +709,7 @@ func (t *MessagesTUI) refresh() {
 
 				var builder strings.Builder
 				for _, msg := range msgs {
-					timeStr := t.formatTime(msg.Date)
-					if msg.IsFromMe {
-						builder.WriteString(fmt.Sprintf("[green][%s] Me:[-] %s\n", timeStr, msg.Text))
-					} else {
-						sender := msg.Sender
-						if len(sender) > MaxSenderNameLength {
-							sender = sender[:MaxSenderNameLength-3] + "..."
-						}
-						builder.WriteString(fmt.Sprintf("[cyan][%s] %s:[-] %s\n", timeStr, sender, msg.Text))
-					}
+					t.formatMessageLine(&builder, msg)
 				}
 				t.msgView.SetText(builder.String())
 				t.msgView.ScrollToEnd()
@@ -810,4 +795,107 @@ func (t *MessagesTUI) formatTime(tm *time.Time) string {
 		return tm.Format("Mon")
 	}
 	return tm.Format("01/02")
+}
+
+// formatMessageLine renders a single message (with attachment info) into the builder.
+func (t *MessagesTUI) formatMessageLine(builder *strings.Builder, msg watcher.Message) {
+	timeStr := t.formatTime(msg.Date)
+	if msg.IsFromMe {
+		builder.WriteString(fmt.Sprintf("[green][%s] Me:[-] %s\n", timeStr, msg.Text))
+	} else {
+		sender := msg.Sender
+		if len(sender) > MaxSenderNameLength {
+			sender = sender[:MaxSenderNameLength-3] + "..."
+		}
+		builder.WriteString(fmt.Sprintf("[cyan][%s] %s:[-] %s\n", timeStr, sender, msg.Text))
+	}
+
+	// Show attachment indicators
+	for _, att := range msg.Attachments {
+		if att.IsImage {
+			builder.WriteString(fmt.Sprintf("              [yellow]📎 %s (image · p to preview)[-]\n", att.Filename))
+		} else {
+			builder.WriteString(fmt.Sprintf("              [gray]📎 %s[-]\n", att.Filename))
+		}
+	}
+}
+
+// showImagePreview shows a modal with a half-block rendered image.
+func (t *MessagesTUI) showImagePreview(att watcher.Attachment) {
+	go func() {
+		t.app.QueueUpdateDraw(func() {
+			t.setStatus("🖼️  Rendering preview...")
+		})
+
+		rendered, err := RenderImageToText(att.FilePath, PreviewMaxWidth, PreviewMaxHeight)
+
+		t.app.QueueUpdateDraw(func() {
+			if err != nil {
+				t.setStatus(fmt.Sprintf("❌ Preview failed: %v", err))
+				return
+			}
+
+			if t.previewModal == nil {
+				t.previewModal = tview.NewTextView().
+					SetDynamicColors(true).
+					SetScrollable(true).
+					SetWrap(false)
+				t.previewModal.SetBorder(true).
+					SetBorderColor(tcell.ColorYellow)
+				t.previewModal.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+					switch event.Key() {
+					case tcell.KeyEscape, tcell.KeyEnter:
+						t.pages.RemovePage("preview")
+						t.app.SetFocus(t.msgView)
+						t.setStatus("[MSG] ↑↓:Scroll  h/←:Back  i:Input  p:Preview  r:Refresh  q:Quit")
+						return nil
+					case tcell.KeyRune:
+						if event.Rune() == 'q' {
+							t.pages.RemovePage("preview")
+							t.app.SetFocus(t.msgView)
+							t.setStatus("[MSG] ↑↓:Scroll  h/←:Back  i:Input  p:Preview  r:Refresh  q:Quit")
+							return nil
+						}
+					}
+					return event
+				})
+			}
+
+			title := fmt.Sprintf(" 🖼️  %s (Esc to close) ", att.Filename)
+			t.previewModal.SetTitle(title)
+			t.previewModal.SetText(rendered)
+			t.previewModal.ScrollToBeginning()
+
+			// Center the modal as an overlay
+			modal := tview.NewFlex().
+				AddItem(nil, 0, 1, false).
+				AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+					AddItem(nil, 0, 1, false).
+					AddItem(t.previewModal, PreviewMaxHeight+2, 0, true).
+					AddItem(nil, 0, 1, false), PreviewMaxWidth+2, 0, true).
+				AddItem(nil, 0, 1, false)
+
+			t.pages.AddPage("preview", modal, true, true)
+			t.app.SetFocus(t.previewModal)
+			t.setStatus("[PREVIEW] Esc/Enter/q:Close  ↑↓:Scroll")
+		})
+	}()
+}
+
+// findNearestImageAttachment scans messages for the nearest image attachment,
+// searching backwards from the most recent message.
+func (t *MessagesTUI) findNearestImageAttachment() *watcher.Attachment {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	// Search from newest to oldest
+	for i := len(t.messages) - 1; i >= 0; i-- {
+		for _, att := range t.messages[i].Attachments {
+			if att.IsImage {
+				a := att // copy
+				return &a
+			}
+		}
+	}
+	return nil
 }
