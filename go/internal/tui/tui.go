@@ -266,9 +266,11 @@ func (t *MessagesTUI) setupCallbacks() {
 				t.sendMessage(text)
 				t.inputField.SetText("")
 			}
-			t.app.SetFocus(t.msgView)
+			// Keep focus on the input field so the user can keep typing
+			t.app.SetFocus(t.inputField)
 		} else if key == tcell.KeyEscape {
 			t.app.SetFocus(t.msgView)
+			t.setStatus("[MSG] ↑↓:Scroll  h/←:Back  i:Input  r:Refresh  q:Quit")
 		}
 	})
 
@@ -370,6 +372,13 @@ func (t *MessagesTUI) setupCallbacks() {
 
 func (t *MessagesTUI) setStatus(msg string) {
 	t.statusBar.SetText(" " + msg + " ")
+}
+
+// setStatusAndDraw updates the status bar and forces an immediate redraw.
+// Use this when calling from the main event loop to ensure the status is visible.
+func (t *MessagesTUI) setStatusAndDraw(msg string) {
+	t.statusBar.SetText(" " + msg + " ")
+	t.app.Draw()
 }
 
 func (t *MessagesTUI) logf(format string, v ...interface{}) {
@@ -578,17 +587,28 @@ func (t *MessagesTUI) sendMessage(text string) {
 }
 
 func (t *MessagesTUI) refresh() {
+	t.logf("refresh: called")
+
 	// Prevent concurrent refreshes
 	if !t.refreshing.CompareAndSwap(false, true) {
+		t.logf("refresh: already refreshing, skipping")
 		return
 	}
 
-	// Set status directly - we're on the main event loop thread
+	t.logf("refresh: acquired refresh lock")
+
+	// Update status text; the screen redraws automatically after the input
+	// handler returns, so calling Draw() here would deadlock.
 	t.setStatus("🔄 Refreshing...")
 
 	// Run refresh in goroutine to avoid blocking UI
 	go func() {
-		defer t.refreshing.Store(false)
+		defer func() {
+			t.refreshing.Store(false)
+			t.logf("refresh: released refresh lock")
+		}()
+
+		t.logf("refresh: goroutine started, fetching conversations...")
 
 		// Use channels to fetch data with timeout
 		type convResult struct {
@@ -600,7 +620,10 @@ func (t *MessagesTUI) refresh() {
 
 		convCh := make(chan convResult, 1)
 		go func() {
-			convCh <- convResult{convs: t.watcher.GetConversations(DefaultConversationLimit)}
+			t.logf("refresh: calling GetConversations...")
+			result := t.watcher.GetConversations(DefaultConversationLimit)
+			t.logf("refresh: GetConversations returned %d items", len(result))
+			convCh <- convResult{convs: result}
 		}()
 
 		// Wait for conversations with timeout
@@ -608,7 +631,9 @@ func (t *MessagesTUI) refresh() {
 		select {
 		case res := <-convCh:
 			convs = res.convs
+			t.logf("refresh: received conversations from channel")
 		case <-time.After(5 * time.Second):
+			t.logf("refresh: TIMEOUT waiting for conversations")
 			t.app.QueueUpdateDraw(func() {
 				t.setStatus("⚠️ Refresh timeout - database may be busy")
 			})
@@ -620,20 +645,27 @@ func (t *MessagesTUI) refresh() {
 		chatID := t.selectedChatID
 		t.mu.Unlock()
 
+		t.logf("refresh: got %d convs, chatID=%d, fetching messages...", len(convs), chatID)
+
 		// Fetch messages before updating UI (if we have a selected chat)
 		var msgs []watcher.Message
 		var chatName string
 		if chatID > 0 {
 			msgCh := make(chan msgResult, 1)
 			go func() {
-				msgCh <- msgResult{msgs: t.watcher.GetMessages(chatID, DefaultMessageLimit)}
+				t.logf("refresh: calling GetMessages for chatID=%d...", chatID)
+				result := t.watcher.GetMessages(chatID, DefaultMessageLimit)
+				t.logf("refresh: GetMessages returned %d items", len(result))
+				msgCh <- msgResult{msgs: result}
 			}()
 
 			// Wait for messages with timeout
 			select {
 			case res := <-msgCh:
 				msgs = res.msgs
+				t.logf("refresh: received messages from channel")
 			case <-time.After(5 * time.Second):
+				t.logf("refresh: TIMEOUT waiting for messages")
 				t.app.QueueUpdateDraw(func() {
 					t.setStatus("⚠️ Message load timeout - database may be busy")
 				})
@@ -655,8 +687,11 @@ func (t *MessagesTUI) refresh() {
 			t.mu.RUnlock()
 		}
 
+		t.logf("refresh: calling QueueUpdateDraw to update UI...")
+
 		// Single QueueUpdateDraw call to update all UI elements atomically
 		t.app.QueueUpdateDraw(func() {
+			t.logf("refresh: inside QueueUpdateDraw callback")
 			// Update conversation list
 			t.convList.Clear()
 			for _, conv := range convs {
@@ -696,7 +731,9 @@ func (t *MessagesTUI) refresh() {
 			}
 
 			t.setStatus("✓ Refreshed!")
+			t.logf("refresh: QueueUpdateDraw callback complete")
 		})
+		t.logf("refresh: QueueUpdateDraw returned")
 	}()
 }
 

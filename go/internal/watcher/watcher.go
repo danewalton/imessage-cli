@@ -114,11 +114,25 @@ func (w *MessageWatcher) getLastMessageID() int64 {
 
 func (w *MessageWatcher) getDBMtime() int64 {
 	dbPath := database.GetDBPath()
+	var latest int64
+
+	// Check main db file
 	info, err := os.Stat(dbPath)
-	if err != nil {
-		return 0
+	if err == nil {
+		latest = info.ModTime().UnixNano()
 	}
-	return info.ModTime().UnixNano()
+
+	// Also check WAL and SHM files — iMessage uses WAL mode, so writes
+	// often land in chat.db-wal without touching the main file's mtime.
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if wi, err := os.Stat(dbPath + suffix); err == nil {
+			if mt := wi.ModTime().UnixNano(); mt > latest {
+				latest = mt
+			}
+		}
+	}
+
+	return latest
 }
 
 // GetConversations returns a list of conversations.
@@ -262,43 +276,45 @@ func (w *MessageWatcher) pollLoop() {
 }
 
 func (w *MessageWatcher) poll() {
-	// Check if database has been modified
+	// Always check for new messages by comparing the max message ROWID.
+	// This is a cheap query and avoids relying solely on file mtime which
+	// can miss changes when SQLite WAL mode is in use.
+	currentMaxID := w.getLastMessageID()
+	lastID := w.lastMessageID.Load()
+
+	if currentMaxID > lastID {
+		newMessages := w.GetNewMessages(lastID)
+		w.lastMessageID.Store(currentMaxID)
+
+		if len(newMessages) > 0 {
+			w.mu.RLock()
+			callbacks := make([]MessageCallback, len(w.messageCallbacks))
+			copy(callbacks, w.messageCallbacks)
+			w.mu.RUnlock()
+
+			for _, cb := range callbacks {
+				go func(callback MessageCallback, msgs []Message) {
+					defer func() {
+						if r := recover(); r != nil {
+							if w.logger != nil {
+								w.logger.Printf("panic in message callback: %v", r)
+							}
+						}
+					}()
+					callback(msgs)
+				}(cb, newMessages)
+			}
+		}
+	}
+
+	// Use mtime (including WAL) to decide whether to refresh the heavier
+	// conversation list query.
 	currentMtime := w.getDBMtime()
 	lastMtime := w.lastMtime.Load()
 
 	if currentMtime > lastMtime {
 		w.lastMtime.Store(currentMtime)
 
-		// Check for new messages
-		currentMaxID := w.getLastMessageID()
-		lastID := w.lastMessageID.Load()
-
-		if currentMaxID > lastID {
-			newMessages := w.GetNewMessages(lastID)
-			w.lastMessageID.Store(currentMaxID)
-
-			if len(newMessages) > 0 {
-				w.mu.RLock()
-				callbacks := make([]MessageCallback, len(w.messageCallbacks))
-				copy(callbacks, w.messageCallbacks)
-				w.mu.RUnlock()
-
-				for _, cb := range callbacks {
-					go func(callback MessageCallback, msgs []Message) {
-						defer func() {
-							if r := recover(); r != nil {
-								if w.logger != nil {
-									w.logger.Printf("panic in message callback: %v", r)
-								}
-							}
-						}()
-						callback(msgs)
-					}(cb, newMessages)
-				}
-			}
-		}
-
-		// Update conversations
 		conversations := w.GetConversations(DefaultConversationLimit)
 		w.mu.RLock()
 		callbacks := make([]ConversationCallback, len(w.conversationCallbacks))
