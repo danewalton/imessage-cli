@@ -61,7 +61,11 @@ imessage read 1 -n 50
 ### Send a message
 
 ```bash
+# By phone number or email
 imessage send "+1234567890" "Hello from the command line!"
+
+# Or by conversation number from `imessage list`
+imessage send 1 "Hi"
 
 # Skip confirmation
 imessage send "+1234567890" "Hi" -y
