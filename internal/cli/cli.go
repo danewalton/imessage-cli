@@ -262,6 +262,7 @@ func cmdRead(conversation string, limit int) {
 		if idx >= 0 && idx < len(conversations) {
 			conv := conversations[idx]
 			chatID = conv.ChatID
+			chatIdentifier = conv.ChatIdentifier
 			chatName = conv.DisplayName
 		} else {
 			fmt.Println(colored(fmt.Sprintf("Invalid conversation number. Use 1-%d", len(conversations)), colorRed))
@@ -331,8 +332,19 @@ func cmdRead(conversation string, limit int) {
 }
 
 func cmdSend(recipient, message string, skipConfirm bool) {
+	displayRecipient := recipient
+	if conversations, convErr := database.GetConversations(100); convErr == nil {
+		if idx, err := strconv.Atoi(recipient); err == nil && idx >= 1 && idx <= len(conversations) {
+			conv := conversations[idx-1]
+			if conv.ChatIdentifier != "" {
+				displayRecipient = fmt.Sprintf("%s (%s)", conv.DisplayName, conv.ChatIdentifier)
+				recipient = conv.ChatIdentifier
+			}
+		}
+	}
+
 	if !skipConfirm {
-		fmt.Printf("%s %s\n", colored("Sending to:", colorBold), recipient)
+		fmt.Printf("%s %s\n", colored("Sending to:", colorBold), displayRecipient)
 		fmt.Printf("%s %s\n", colored("Message:", colorBold), message)
 
 		reader := bufio.NewReader(os.Stdin)
