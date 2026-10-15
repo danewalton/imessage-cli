@@ -201,6 +201,7 @@ History and incremental reads share database-layer decoding. Incremental callbac
 - **Literal content:** Message bodies, names, attachment filenames, and error text are escaped before insertion into tview markup.
 - **Live updates:** The `watcher.MessageWatcher` fires callbacks that automatically update the conversation list and message view when new data arrives.
 - **Reaction display:** Current Tapbacks render beneath their target with names and part labels. Labels and names are escaped like message text. Refreshing an unchanged message window preserves its scroll position, including reaction-only additions/removals, without changing the composer.
+- **Emoji widths:** The terminal renderer measures complete grapheme clusters, including variation selectors and flags. Counting only the first rune can shift reaction text and leave suffixes such as `1)` on screen after a conversation switch, especially in tmux. Keep the grapheme-aware tcell dependency; extra screen clears do not correct the width mismatch.
 - **Debug mode:** `imessage tui --debug` uses a private per-user cache directory (`~/Library/Caches/imessage-cli/tui.log` on macOS). Directory/file permissions are owner-only, and log files must be regular, owned by the current user, and not symlinked or hard-linked. Events record key types and focused widget types, never composer characters.
 
 Search streams messages newest-first, extracts the same text used for reading, and then applies a literal case-insensitive match and result limit. This avoids binary-NUL and serialization-metadata mismatches at the cost of scanning/decoding more history for rare queries; it does not create an index or write to chat.db.
@@ -254,7 +255,7 @@ Poll tick:
 | `github.com/spf13/cobra` | v1.8.0 | CLI command framework |
 | `github.com/mattn/go-sqlite3` | v1.14.22 | CGo SQLite3 driver for reading `chat.db` and AddressBook |
 | `github.com/rivo/tview` | v0.0.0-20240101 | Terminal UI framework |
-| `github.com/gdamore/tcell/v2` | v2.7.0 | Terminal cell library (tview dependency) |
+| `github.com/gdamore/tcell/v2` | v2.13.10 | Grapheme-aware terminal cells (tview dependency) |
 
 ## System Requirements & Permissions
 
