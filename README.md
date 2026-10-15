@@ -14,13 +14,12 @@ A command-line tool for reading and sending iMessages on macOS.
 ## Requirements
 
 - macOS (uses the Messages app and iMessage database)
-- Go 1.21 or later
+- Go 1.24 or later
 - Full Disk Access permission for Terminal/your terminal emulator
 
 ## Building
 
 ```bash
-cd go
 go mod download
 go build -o imessage ./cmd/imessage
 ```
@@ -56,7 +55,14 @@ imessage read "+1234567890"
 
 # Specify number of messages
 imessage read 1 -n 50
+
+# Use the stable Chat ID shown by list
+imessage read chat:42
 ```
+
+`read` and `chat` accept a list index, a phone number, an email, or a stable `chat:<id>` reference. Bare numbers of up to three digits are list indexes; longer numbers and `+`-prefixed numbers are phone addresses. Use a quoted `"#1"` for an explicit index. List positions change when new messages arrive, so use `chat:<id>` for saved commands.
+
+Phone and email lookups use exact matches and supported phone-number variants, never substring matches. If more than one direct conversation matches, select its Chat ID from `list`.
 
 ### Send a message
 
@@ -65,13 +71,19 @@ imessage send "+1234567890" "Hello from the command line!"
 
 # Skip confirmation
 imessage send "+1234567890" "Hi" -y
+
+# Reply to an existing conversation, including a group
+imessage send chat:42 "Hello everyone!"
 ```
+
+Replies to existing conversations use their exact Messages chat ID. Groups are not selected by their display name or by one participant. The reply tip printed by `read` uses a stable Chat ID.
 
 ### Interactive chat mode
 
 ```bash
 imessage chat 1
 imessage chat "+1234567890"
+imessage chat chat:42
 ```
 
 ### Search messages
@@ -80,6 +92,8 @@ imessage chat "+1234567890"
 imessage search "meeting"
 imessage search "project" -n 50
 ```
+
+Search matches literal text without regard to case, including decoded rich-text messages. `%` and `_` are literal characters, not wildcards. Search reads messages newest-first until it finds the requested number of matches; rare searches over a large history can take longer because rich-text bodies must be decoded.
 
 ### Launch TUI (Terminal User Interface)
 
@@ -95,6 +109,8 @@ imessage watch
 imessage status
 ```
 
+Database access and query failures are reported as errors rather than empty accounts or zero statistics. `status` exits with a nonzero status when its database checks fail.
+
 ## TUI Controls
 
 | Key | Action |
@@ -105,10 +121,23 @@ imessage status
 | `h/←` | Go back to conversations |
 | `l/→` | Go to messages |
 | `i` | Start typing a message |
+| `Enter` in the input field | Send the current draft |
+| `Esc` in the input field | Return to messages without discarding the draft |
+| `Ctrl+R` | Recover a failed message for the selected conversation, when the input is empty |
 | `r` | Refresh |
 | `g` | Go to top (messages) |
 | `G` | Go to bottom (messages) |
 | `q` | Quit |
+
+Drafts stay with their conversations when you switch chats or the list reorders. A pending send does not accept a second message; the second draft stays in the input. Failed messages are restored only if you have not edited or switched the composer. Otherwise, select the original conversation and use `Ctrl+R` with an empty input to recover the failed message. Drafts and failed messages are kept only for the current TUI session.
+
+### Private debug logging
+
+```bash
+imessage tui --debug
+```
+
+On macOS, the log is `~/Library/Caches/imessage-cli/tui.log`. The log directory and file are accessible only to your user. Debug logging records event types and focus changes, not typed message characters. The old `/tmp/imessage-tui.log` is no longer used; remove any old copies if they contain private drafts.
 
 ## Permissions
 
@@ -126,7 +155,7 @@ To grant Full Disk Access:
 ## Project Structure
 
 ```
-go/
+imessage-cli/
 ├── cmd/
 │   └── imessage/
 │       └── main.go           # Entry point

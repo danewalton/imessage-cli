@@ -80,24 +80,26 @@ Examples:
   imessage tui                     Launch interactive TUI with live updates
   imessage list                    List recent conversations
   imessage read 1                  Read messages from conversation #1
+  imessage read chat:42            Read a stable conversation ID
   imessage read "+1234567890"      Read messages from a phone number
   imessage send "+1234567890" "Hi" Send a message
+  imessage send chat:42 "Hi"       Reply to an existing chat or group
   imessage chat 1                  Start interactive chat with conversation #1
   imessage search "meeting"        Search for messages containing "meeting"
 
 Note: This tool requires macOS with Messages configured and proper permissions.`,
-	Run: func(cmd *cobra.Command, args []string) {
-		cmdList(20)
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return cmdList(20)
 	},
 }
 
 var listCmd = &cobra.Command{
 	Use:     "list",
 	Aliases: []string{"ls", "l"},
-	Short:   "List recent conversations",
-	Run: func(cmd *cobra.Command, args []string) {
+	Short:   "List recent conversations and stable chat IDs",
+	RunE: func(cmd *cobra.Command, args []string) error {
 		limit, _ := cmd.Flags().GetInt("limit")
-		cmdList(limit)
+		return cmdList(limit)
 	},
 }
 
@@ -105,10 +107,11 @@ var readCmd = &cobra.Command{
 	Use:     "read <conversation>",
 	Aliases: []string{"r", "view"},
 	Short:   "Read messages from a conversation",
+	Long:    "Read messages using a list index, phone number, email, or stable chat:<id> reference.",
 	Args:    cobra.ExactArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		limit, _ := cmd.Flags().GetInt("limit")
-		cmdRead(args[0], limit)
+		return cmdRead(args[0], limit)
 	},
 }
 
@@ -116,10 +119,11 @@ var sendCmd = &cobra.Command{
 	Use:     "send <recipient> <message>",
 	Aliases: []string{"s"},
 	Short:   "Send a message",
+	Long:    "Send to a phone number or email, or use chat:<id> for an existing direct or group conversation.",
 	Args:    cobra.ExactArgs(2),
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		yes, _ := cmd.Flags().GetBool("yes")
-		cmdSend(args[0], args[1], yes)
+		return cmdSend(args[0], args[1], yes)
 	},
 }
 
@@ -127,9 +131,10 @@ var chatCmd = &cobra.Command{
 	Use:     "chat <contact>",
 	Aliases: []string{"c"},
 	Short:   "Interactive chat mode",
+	Long:    "Start interactive chat using a list index, phone number, email, or stable chat:<id> reference.",
 	Args:    cobra.ExactArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
-		cmdChat(args[0])
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return cmdChat(args[0])
 	},
 }
 
@@ -138,17 +143,17 @@ var searchCmd = &cobra.Command{
 	Aliases: []string{"find", "grep"},
 	Short:   "Search messages",
 	Args:    cobra.ExactArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		limit, _ := cmd.Flags().GetInt("limit")
-		cmdSearch(args[0], limit)
+		return cmdSearch(args[0], limit)
 	},
 }
 
 var statusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Show status and statistics",
-	Run: func(cmd *cobra.Command, args []string) {
-		cmdStatus()
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return cmdStatus()
 	},
 }
 
@@ -156,21 +161,20 @@ var tuiCmd = &cobra.Command{
 	Use:     "tui",
 	Aliases: []string{"ui", "watch"},
 	Short:   "Launch interactive TUI with live updates",
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		// Read debug flag from the command's flags to avoid init-time cycles
 		debug, _ := cmd.Flags().GetBool("debug")
 		if debug {
 			if err := tui.RunWithDebug(true, ""); err != nil {
-				fmt.Println(colored(fmt.Sprintf("Error launching TUI: %v", err), colorRed))
-				os.Exit(1)
+				return fmt.Errorf("launch TUI: %w", err)
 			}
-			return
+			return nil
 		}
 
 		if err := tui.Run(); err != nil {
-			fmt.Println(colored(fmt.Sprintf("Error launching TUI: %v", err), colorRed))
-			os.Exit(1)
+			return fmt.Errorf("launch TUI: %w", err)
 		}
+		return nil
 	},
 }
 
@@ -195,31 +199,32 @@ func init() {
 	rootCmd.AddCommand(searchCmd)
 	rootCmd.AddCommand(statusCmd)
 	// Add tui command with debug flag
-	tuiCmd.Flags().BoolP("debug", "d", false, "Enable TUI debug logging to /tmp/imessage-tui.log")
+	tuiCmd.Flags().BoolP("debug", "d", false, "Enable private TUI debug logging in the user cache directory")
 	rootCmd.AddCommand(tuiCmd)
 	rootCmd.AddCommand(versionCmd)
 }
 
 // Execute runs the root command.
 func Execute() error {
+	rootCmd.SilenceErrors = true
+	rootCmd.SilenceUsage = true
 	return rootCmd.Execute()
 }
 
-func cmdList(limit int) {
+func cmdList(limit int) error {
 	conversations, err := database.GetConversations(limit)
 	if err != nil {
-		fmt.Println(colored(fmt.Sprintf("Error: %v", err), colorRed))
-		os.Exit(1)
+		return fmt.Errorf("load conversations: %w", err)
 	}
 
 	if len(conversations) == 0 {
 		fmt.Println("No conversations found.")
-		return
+		return nil
 	}
 
-	header := fmt.Sprintf("\n%-4s %-30s %-20s %-10s", "#", "Contact", "Last Message", "Service")
+	header := fmt.Sprintf("\n%-4s %-12s %-30s %-20s %-10s", "#", "Chat ID", "Contact", "Last Message", "Service")
 	fmt.Println(colored(header, colorBold, colorCyan))
-	fmt.Println(strings.Repeat("-", 70))
+	fmt.Println(strings.Repeat("-", 83))
 
 	for i, conv := range conversations {
 		name := truncate(conv.DisplayName, 28)
@@ -234,75 +239,111 @@ func cmdList(limit int) {
 			serviceColor = colorGreen
 		}
 
-		fmt.Printf("%-4d %-30s %-20s %s\n", i+1, name, dateStr, colored(service, serviceColor))
+		fmt.Printf("%-4d %-12s %-30s %-20s %s\n", i+1, fmt.Sprintf("chat:%d", conv.ChatID), name, dateStr, colored(service, serviceColor))
 	}
 
-	unread, _ := database.GetUnreadCount()
+	unread, err := database.GetUnreadCount()
+	if err != nil {
+		return fmt.Errorf("load unread count: %w", err)
+	}
 	if unread > 0 {
 		fmt.Println(colored(fmt.Sprintf("\n📬 %d unread message(s)", unread), colorYellow, colorBold))
 	}
 
-	fmt.Println(colored("\nTip: Use 'imessage read <number>' to view messages from a conversation", colorDim))
+	fmt.Println(colored("\nTip: Use 'imessage read <number>' or a stable 'chat:<id>' reference", colorDim))
+	return nil
 }
 
-func cmdRead(conversation string, limit int) {
-	conversations, err := database.GetConversations(100)
-	if err != nil {
-		fmt.Println(colored(fmt.Sprintf("Error: %v", err), colorRed))
-		os.Exit(1)
+type conversationTarget struct {
+	conversation *database.Conversation
+	recipient    string
+}
+
+func (target conversationTarget) name() string {
+	if target.conversation != nil && target.conversation.DisplayName != "" {
+		return target.conversation.DisplayName
 	}
+	return target.recipient
+}
 
-	var chatID int64
-	var chatIdentifier string
-	var chatName string
+func (target conversationTarget) messages(limit int) ([]database.Message, error) {
+	if target.conversation != nil {
+		return database.GetMessages(target.conversation.ChatID, "", limit)
+	}
+	return database.GetMessages(0, target.recipient, limit)
+}
 
-	if idx, err := strconv.Atoi(conversation); err == nil {
-		// User provided a number from the list
-		idx--
-		if idx >= 0 && idx < len(conversations) {
-			conv := conversations[idx]
-			chatID = conv.ChatID
-			chatName = conv.DisplayName
-		} else {
-			fmt.Println(colored(fmt.Sprintf("Invalid conversation number. Use 1-%d", len(conversations)), colorRed))
-			os.Exit(1)
-		}
-	} else {
-		// User provided a phone number or identifier
-		chatIdentifier = conversation
-		contact, _ := database.GetContactByIdentifier(chatIdentifier)
-		if contact != nil {
-			if contact.ChatIdentifier != "" {
-				chatIdentifier = contact.ChatIdentifier
+func (target conversationTarget) send(message string) error {
+	if target.conversation != nil {
+		return sender.SendToConversation(*target.conversation, message)
+	}
+	return sender.SendMessage(target.recipient, message)
+}
+
+func conversationIndex(reference string) (int, bool, error) {
+	explicit := strings.HasPrefix(reference, "#")
+	number := strings.TrimPrefix(reference, "#")
+	if !explicit && (len(number) == 0 || len(number) > 3) {
+		return 0, false, nil
+	}
+	for _, r := range number {
+		if r < '0' || r > '9' {
+			if explicit {
+				return 0, true, fmt.Errorf("invalid conversation index %q", reference)
 			}
-			if contact.DisplayName != "" {
-				chatName = contact.DisplayName
-			} else {
-				chatName = chatIdentifier
-			}
-		} else {
-			chatName = chatIdentifier
+			return 0, false, nil
 		}
 	}
-
-	var messages []database.Message
-	if chatID > 0 {
-		messages, err = database.GetMessages(chatID, "", limit)
-	} else {
-		messages, err = database.GetMessages(0, chatIdentifier, limit)
+	index, err := strconv.Atoi(number)
+	if err != nil || index < 1 {
+		return 0, true, fmt.Errorf("invalid conversation index %q", reference)
 	}
+	return index, true, nil
+}
 
+func resolveConversation(reference string) (conversationTarget, error) {
+	if strings.HasPrefix(reference, "chat:") {
+		id, err := strconv.ParseInt(strings.TrimPrefix(reference, "chat:"), 10, 64)
+		if err != nil || id <= 0 {
+			return conversationTarget{}, fmt.Errorf("invalid chat reference %q", reference)
+		}
+		conv, err := database.GetConversationByID(id)
+		return conversationTarget{conversation: conv}, err
+	}
+	index, isIndex, err := conversationIndex(reference)
 	if err != nil {
-		fmt.Println(colored(fmt.Sprintf("Error reading messages: %v", err), colorRed))
-		os.Exit(1)
+		return conversationTarget{}, err
+	}
+	if isIndex {
+		convs, err := database.GetConversations(100)
+		if err != nil {
+			return conversationTarget{}, err
+		}
+		if index > len(convs) {
+			return conversationTarget{}, fmt.Errorf("invalid conversation number; use 1-%d", len(convs))
+		}
+		return conversationTarget{conversation: &convs[index-1]}, nil
+	}
+	conv, err := database.GetContactByIdentifier(reference)
+	return conversationTarget{conversation: conv, recipient: reference}, err
+}
+
+func cmdRead(conversation string, limit int) error {
+	target, err := resolveConversation(conversation)
+	if err != nil {
+		return err
+	}
+	messages, err := target.messages(limit)
+	if err != nil {
+		return fmt.Errorf("read messages: %w", err)
 	}
 
 	if len(messages) == 0 {
-		fmt.Printf("No messages found for %s\n", chatName)
-		return
+		fmt.Printf("No messages found for %s\n", target.name())
+		return nil
 	}
 
-	fmt.Println(colored(fmt.Sprintf("\n📱 Messages with %s", chatName), colorBold, colorCyan))
+	fmt.Println(colored(fmt.Sprintf("\n📱 Messages with %s", target.name()), colorBold, colorCyan))
 	fmt.Println(strings.Repeat("-", 60))
 
 	for _, msg := range messages {
@@ -323,16 +364,33 @@ func cmdRead(conversation string, limit int) {
 
 	fmt.Println("\n" + strings.Repeat("-", 60))
 
-	replyTarget := chatIdentifier
-	if replyTarget == "" {
-		replyTarget = conversation
+	replyTarget := target.recipient
+	if target.conversation != nil {
+		replyTarget = fmt.Sprintf("chat:%d", target.conversation.ChatID)
 	}
-	fmt.Println(colored(fmt.Sprintf("Reply: imessage send \"%s\" \"your message\"", replyTarget), colorDim))
+	fmt.Println(colored(fmt.Sprintf("Reply: imessage send %s 'your message'", shellQuote(replyTarget)), colorDim))
+	return nil
 }
 
-func cmdSend(recipient, message string, skipConfirm bool) {
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
+func cmdSend(recipient, message string, skipConfirm bool) error {
+	target := conversationTarget{recipient: recipient}
+	if strings.HasPrefix(recipient, "chat:") {
+		var err error
+		target, err = resolveConversation(recipient)
+		if err != nil {
+			return err
+		}
+	}
 	if !skipConfirm {
-		fmt.Printf("%s %s\n", colored("Sending to:", colorBold), recipient)
+		destination := recipient
+		if target.conversation != nil {
+			destination = fmt.Sprintf("%s (%s)", target.name(), recipient)
+		}
+		fmt.Printf("%s %s\n", colored("Sending to:", colorBold), destination)
 		fmt.Printf("%s %s\n", colored("Message:", colorBold), message)
 
 		reader := bufio.NewReader(os.Stdin)
@@ -342,75 +400,40 @@ func cmdSend(recipient, message string, skipConfirm bool) {
 
 		if confirm != "y" && confirm != "yes" {
 			fmt.Println("Message cancelled.")
-			return
+			return nil
 		}
 	}
 
 	fmt.Println("Sending message...")
 
-	err := sender.SendMessage(recipient, message)
+	err := target.send(message)
 	if err != nil {
-		fmt.Println(colored(fmt.Sprintf("Error: %v", err), colorRed))
 		fmt.Println(colored("\nMake sure:", colorYellow))
 		fmt.Println("  1. Messages app is configured and signed in")
 		fmt.Println("  2. You've granted Terminal/SSH full disk access in System Preferences")
-		fmt.Println("  3. The recipient is a valid phone number or email")
-		os.Exit(1)
+		fmt.Println("  3. The recipient is a valid phone number, email, or chat:<id> reference")
+		return err
 	}
 
 	fmt.Println(colored("✓ Message sent successfully!", colorGreen, colorBold))
+	return nil
 }
 
-func cmdChat(contact string) {
-	conversations, err := database.GetConversations(100)
+func cmdChat(contact string) error {
+	target, err := resolveConversation(contact)
 	if err != nil {
-		fmt.Println(colored(fmt.Sprintf("Error: %v", err), colorRed))
-		os.Exit(1)
+		return err
 	}
 
-	var chatID int64
-	var chatIdentifier string
-	var chatName string
-
-	if idx, err := strconv.Atoi(contact); err == nil {
-		idx--
-		if idx >= 0 && idx < len(conversations) {
-			conv := conversations[idx]
-			chatID = conv.ChatID
-			chatIdentifier = conv.ChatIdentifier
-			chatName = conv.DisplayName
-		} else {
-			fmt.Println(colored("Invalid conversation number", colorRed))
-			os.Exit(1)
-		}
-	} else {
-		chatIdentifier = contact
-		c, _ := database.GetContactByIdentifier(chatIdentifier)
-		if c != nil {
-			if c.ChatIdentifier != "" {
-				chatIdentifier = c.ChatIdentifier
-			}
-			if c.DisplayName != "" {
-				chatName = c.DisplayName
-			} else {
-				chatName = chatIdentifier
-			}
-		} else {
-			chatName = chatIdentifier
-		}
-	}
-
-	fmt.Println(colored(fmt.Sprintf("\n💬 Chat with %s", chatName), colorBold, colorCyan))
+	fmt.Println(colored(fmt.Sprintf("\n💬 Chat with %s", target.name()), colorBold, colorCyan))
 	fmt.Println(colored("Type your message and press Enter to send. Type 'quit' or Ctrl+C to exit.", colorDim))
 	fmt.Println(colored("Type 'refresh' or 'r' to reload messages.", colorDim))
 	fmt.Println(strings.Repeat("-", 60))
 
-	showMessages := func() {
-		var messages []database.Message
-		if chatID > 0 {
-			messages, _ = database.GetMessages(chatID, "", 10)
-		} else {
-			messages, _ = database.GetMessages(0, chatIdentifier, 10)
+	showMessages := func() error {
+		messages, err := target.messages(10)
+		if err != nil {
+			return fmt.Errorf("load messages: %w", err)
 		}
 
 		for _, msg := range messages {
@@ -426,9 +449,12 @@ func cmdChat(contact string) {
 			}
 		}
 		fmt.Println()
+		return nil
 	}
 
-	showMessages()
+	if err := showMessages(); err != nil {
+		return err
+	}
 
 	reader := bufio.NewReader(os.Stdin)
 	for {
@@ -444,34 +470,36 @@ func cmdChat(contact string) {
 		switch strings.ToLower(input) {
 		case "quit", "exit", "q":
 			fmt.Println("Goodbye!")
-			return
+			return nil
 		case "refresh", "r":
 			fmt.Println(colored("\n--- Refreshing ---\n", colorDim))
-			showMessages()
+			if err := showMessages(); err != nil {
+				fmt.Fprintln(os.Stderr, "Error refreshing:", err)
+			}
 			continue
 		case "":
 			continue
 		}
 
-		err = sender.SendMessage(chatIdentifier, input)
+		err = target.send(input)
 		if err != nil {
-			fmt.Println(colored("  ✗ Failed to send", colorRed))
+			fmt.Println(colored(fmt.Sprintf("  ✗ Failed to send: %v", err), colorRed))
 		} else {
 			fmt.Println(colored("  ✓ Sent", colorDim))
 		}
 	}
+	return nil
 }
 
-func cmdSearch(query string, limit int) {
+func cmdSearch(query string, limit int) error {
 	results, err := database.SearchMessages(query, limit)
 	if err != nil {
-		fmt.Println(colored(fmt.Sprintf("Error searching: %v", err), colorRed))
-		os.Exit(1)
+		return fmt.Errorf("search messages: %w", err)
 	}
 
 	if len(results) == 0 {
 		fmt.Printf("No messages found matching '%s'\n", query)
-		return
+		return nil
 	}
 
 	fmt.Println(colored(fmt.Sprintf("\nSearch results for '%s':", query), colorBold, colorCyan))
@@ -494,9 +522,10 @@ func cmdSearch(query string, limit int) {
 	}
 
 	fmt.Printf("\nFound %d message(s)\n", len(results))
+	return nil
 }
 
-func cmdStatus() {
+func cmdStatus() error {
 	fmt.Println(colored("\n📊 iMessage CLI Status", colorBold, colorCyan))
 	fmt.Println(strings.Repeat("-", 40))
 
@@ -505,7 +534,7 @@ func cmdStatus() {
 	if _, err := os.Stat(dbPath); err == nil {
 		fmt.Printf("%s Database found: %s\n", colored("✓", colorGreen), dbPath)
 	} else {
-		fmt.Printf("%s Database not found: %s\n", colored("✗", colorRed), dbPath)
+		return fmt.Errorf("cannot access database %s: %w (check Full Disk Access)", dbPath, err)
 	}
 
 	// Check Messages app
@@ -516,18 +545,18 @@ func cmdStatus() {
 	}
 
 	// Show stats
-	conversations, _ := database.GetConversations(1000)
-	unread, _ := database.GetUnreadCount()
+	conversations, err := database.GetConversations(1000)
+	if err != nil {
+		return fmt.Errorf("load conversation statistics: %w (check Full Disk Access)", err)
+	}
+	unread, err := database.GetUnreadCount()
+	if err != nil {
+		return fmt.Errorf("load unread statistics: %w", err)
+	}
 
 	fmt.Println("\n📈 Statistics:")
 	fmt.Printf("   Conversations: %d\n", len(conversations))
 	fmt.Printf("   Unread messages: %d\n", unread)
 	fmt.Println()
-}
-
-func cmdTUI() {
-	if err := tui.Run(); err != nil {
-		fmt.Println(colored(fmt.Sprintf("Error launching TUI: %v", err), colorRed))
-		os.Exit(1)
-	}
+	return nil
 }

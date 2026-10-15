@@ -16,9 +16,10 @@ import (
 )
 
 var (
-	sharedDB   *sql.DB
-	dbOnce     sync.Once
-	dbInitErr  error
+	sharedDB      *sql.DB
+	dbOnce        sync.Once
+	dbInitErr     error
+	printableText = regexp.MustCompile(`[\x20-\x7E\x{00A0}-\x{10FFFF}]{3,}`)
 )
 
 // Attachment represents a file attachment on an iMessage.
@@ -50,6 +51,7 @@ type Message struct {
 // Conversation represents a chat/conversation.
 type Conversation struct {
 	ChatID          int64
+	ChatGUID        string
 	ChatIdentifier  string
 	DisplayName     string
 	Service         string
@@ -69,8 +71,8 @@ func GetDBPath() string {
 func initDB() {
 	dbOnce.Do(func() {
 		dbPath := GetDBPath()
-		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-			dbInitErr = fmt.Errorf("iMessage database not found at %s. Make sure you're running this on macOS with Messages configured", dbPath)
+		if _, err := os.Stat(dbPath); err != nil {
+			dbInitErr = fmt.Errorf("cannot access iMessage database at %s: %w (check Messages configuration and Full Disk Access)", dbPath, err)
 			return
 		}
 
@@ -200,8 +202,7 @@ func ExtractTextFromAttributedBody(data []byte) string {
 	}
 
 	// Method 3: Look for any readable text using regex
-	re := regexp.MustCompile(`[\x20-\x7E\u00A0-\uFFFF]{3,}`)
-	matches := re.FindAllString(decoded, -1)
+	matches := printableText.FindAllString(decoded, -1)
 	if len(matches) > 0 {
 		// Filter out known serialization artifacts
 		artifacts := []string{"bplist", "NSString", "NSNumber", "NSDictionary",
@@ -248,14 +249,31 @@ func cleanPrintable(s string) string {
 
 // GetConversations retrieves a list of recent conversations.
 func GetConversations(limit int) ([]Conversation, error) {
+	return getConversations(limit, "1")
+}
+
+// GetConversationByID resolves a stable local chat ID.
+func GetConversationByID(chatID int64) (*Conversation, error) {
+	convs, err := getConversations(1, "c.ROWID = ?", chatID)
+	if err != nil {
+		return nil, err
+	}
+	if len(convs) == 0 {
+		return nil, fmt.Errorf("conversation chat:%d not found", chatID)
+	}
+	return &convs[0], nil
+}
+
+func getConversations(limit int, filter string, args ...any) ([]Conversation, error) {
 	db, err := DB()
 	if err != nil {
 		return nil, err
 	}
 
-	query := `
+	query := fmt.Sprintf(`
 		SELECT 
 			c.ROWID as chat_id,
+			c.guid,
 			c.chat_identifier,
 			c.display_name,
 			c.service_name,
@@ -266,12 +284,13 @@ func GetConversations(limit int) ([]Conversation, error) {
 		LEFT JOIN message m ON cmj.message_id = m.ROWID
 		LEFT JOIN chat_handle_join chj ON c.ROWID = chj.chat_id
 		LEFT JOIN handle h ON chj.handle_id = h.ROWID
+		WHERE %s
 		GROUP BY c.ROWID
 		ORDER BY last_message_date DESC
 		LIMIT ?
-	`
+	`, filter)
 
-	rows, err := db.Query(query, limit)
+	rows, err := db.Query(query, append(args, limit)...)
 	if err != nil {
 		return nil, err
 	}
@@ -280,15 +299,16 @@ func GetConversations(limit int) ([]Conversation, error) {
 	var conversations []Conversation
 	for rows.Next() {
 		var c Conversation
-		var chatIdentifier, displayName, service sql.NullString
+		var guid, chatIdentifier, displayName, service sql.NullString
 		var lastMessageDate sql.NullInt64
 		var participants sql.NullString
 
-		err := rows.Scan(&c.ChatID, &chatIdentifier, &displayName, &service, &lastMessageDate, &participants)
+		err := rows.Scan(&c.ChatID, &guid, &chatIdentifier, &displayName, &service, &lastMessageDate, &participants)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("read conversation: %w", err)
 		}
 
+		c.ChatGUID = guid.String
 		c.ChatIdentifier = chatIdentifier.String
 		c.DisplayName = displayName.String
 		c.Service = service.String
@@ -312,7 +332,7 @@ func GetConversations(limit int) ([]Conversation, error) {
 		conversations = append(conversations, c)
 	}
 
-	return conversations, nil
+	return conversations, rows.Err()
 }
 
 // GetMessages retrieves messages from a specific conversation.
@@ -373,7 +393,7 @@ func GetMessages(chatID int64, chatIdentifier string, limit int) ([]Message, err
 
 		err := rows.Scan(&m.MessageID, &text, &attributedBody, &date, &isFromMe, &isRead, &service, &senderID, &m.ChatID, &chatIdent, &chatName)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("read message: %w", err)
 		}
 
 		m.IsFromMe = isFromMe == 1
@@ -405,6 +425,12 @@ func GetMessages(chatID int64, chatIdentifier string, limit int) ([]Message, err
 
 		messages = append(messages, m)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
 
 	// Reverse to show oldest first
 	for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
@@ -418,7 +444,10 @@ func GetMessages(chatID int64, chatIdentifier string, limit int) ([]Message, err
 			msgIDs[i] = m.MessageID
 		}
 		attMap, err := GetAttachmentsForMessages(msgIDs)
-		if err == nil && attMap != nil {
+		if err != nil {
+			return nil, fmt.Errorf("load message attachments: %w", err)
+		}
+		if attMap != nil {
 			for i := range messages {
 				if atts, ok := attMap[messages[i].MessageID]; ok {
 					messages[i].Attachments = atts
@@ -430,7 +459,7 @@ func GetMessages(chatID int64, chatIdentifier string, limit int) ([]Message, err
 	return messages, nil
 }
 
-// SearchMessages searches for messages containing the given text.
+// SearchMessages searches decoded message text, newest matches first.
 func SearchMessages(query string, limit int) ([]Message, error) {
 	db, err := DB()
 	if err != nil {
@@ -451,20 +480,19 @@ func SearchMessages(query string, limit int) ([]Message, error) {
 		LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
 		LEFT JOIN chat c ON cmj.chat_id = c.ROWID
 		LEFT JOIN handle h ON m.handle_id = h.ROWID
-		WHERE m.text LIKE ? OR CAST(m.attributedBody AS TEXT) LIKE ?
+		WHERE m.text IS NOT NULL OR m.attributedBody IS NOT NULL
 		ORDER BY m.date DESC
-		LIMIT ?
 	`
 
-	searchPattern := "%" + query + "%"
-	rows, err := db.Query(sqlQuery, searchPattern, searchPattern, limit)
+	rows, err := db.Query(sqlQuery)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
 	var results []Message
-	for rows.Next() {
+	needle := strings.ToLower(query)
+	for (limit < 0 || len(results) < limit) && rows.Next() {
 		var m Message
 		var text, chatIdent, chatName, senderID sql.NullString
 		var attributedBody []byte
@@ -473,7 +501,7 @@ func SearchMessages(query string, limit int) ([]Message, error) {
 
 		err := rows.Scan(&m.MessageID, &text, &attributedBody, &date, &isFromMe, &chatIdent, &chatName, &senderID)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("read search result: %w", err)
 		}
 
 		m.IsFromMe = isFromMe == 1
@@ -488,8 +516,8 @@ func SearchMessages(query string, limit int) ([]Message, error) {
 		if m.Text == "" && len(attributedBody) > 0 {
 			m.Text = ExtractTextFromAttributedBody(attributedBody)
 		}
-		if m.Text == "" {
-			m.Text = "[Attachment]"
+		if m.Text == "" || !strings.Contains(strings.ToLower(m.Text), needle) {
+			continue
 		}
 
 		m.Sender = ResolveSender(m.IsFromMe, senderID.String)
@@ -501,7 +529,7 @@ func SearchMessages(query string, limit int) ([]Message, error) {
 		results = append(results, m)
 	}
 
-	return results, nil
+	return results, rows.Err()
 }
 
 // GetUnreadCount returns the count of unread messages.
@@ -523,67 +551,73 @@ func GetUnreadCount() (int, error) {
 
 // GetContactByIdentifier looks up a contact by phone number or email.
 func GetContactByIdentifier(identifier string) (*Conversation, error) {
-	db, err := DB()
+	variants, err := identifierVariants(identifier)
 	if err != nil {
 		return nil, err
 	}
-
-	// Normalize identifier
-	normalized := normalizeIdentifier(identifier)
-
-	var c Conversation
-	var chatIdent, displayName, service sql.NullString
-
-	err = db.QueryRow(`
-		SELECT DISTINCT 
-			h.id as identifier,
-			h.service,
-			c.chat_identifier,
-			c.display_name
-		FROM handle h
-		LEFT JOIN chat_handle_join chj ON h.ROWID = chj.handle_id
-		LEFT JOIN chat c ON chj.chat_id = c.ROWID
-		WHERE h.id LIKE ? OR h.id LIKE ?
-		LIMIT 1
-	`, "%"+identifier+"%", "%"+normalized+"%").Scan(&chatIdent, &service, &c.ChatIdentifier, &displayName)
-
-	if err == sql.ErrNoRows {
+	placeholders := make([]string, len(variants))
+	args := make([]any, len(variants))
+	for i, variant := range variants {
+		placeholders[i], args[i] = "?", variant
+	}
+	filter := fmt.Sprintf(`c.ROWID IN (
+		SELECT chj.chat_id FROM chat_handle_join chj
+		JOIN handle h ON h.ROWID = chj.handle_id
+		WHERE LOWER(h.id) IN (%s)
+	) AND (SELECT COUNT(DISTINCT handle_id) FROM chat_handle_join WHERE chat_id = c.ROWID) = 1`,
+		strings.Join(placeholders, ","))
+	convs, err := getConversations(2, filter, args...)
+	if err != nil {
+		return nil, err
+	}
+	if len(convs) > 1 {
+		return nil, fmt.Errorf("multiple conversations match %q; select one from 'imessage list' or use chat:<id>", identifier)
+	}
+	if len(convs) == 0 {
 		return nil, nil
 	}
-	if err != nil {
-		return nil, err
-	}
-
-	c.DisplayName = displayName.String
-	c.Service = service.String
-
-	return &c, nil
+	return &convs[0], nil
 }
 
-func normalizeIdentifier(identifier string) string {
-	var result strings.Builder
-	for _, c := range identifier {
-		if unicode.IsDigit(c) || c == '+' || c == '@' || c == '.' {
-			result.WriteRune(c)
+func identifierVariants(identifier string) ([]string, error) {
+	identifier = strings.TrimSpace(identifier)
+	if identifier == "" {
+		return nil, fmt.Errorf("recipient must not be empty")
+	}
+	if strings.Contains(identifier, "@") {
+		return []string{strings.ToLower(identifier)}, nil
+	}
+	for _, r := range identifier {
+		if !strings.ContainsRune("0123456789+()- .", r) {
+			return []string{identifier}, nil
 		}
 	}
-	return result.String()
+	if strings.Count(identifier, "+") > 1 || strings.Index(identifier, "+") > 0 {
+		return nil, fmt.Errorf("invalid phone number %q: '+' is only allowed at the beginning", identifier)
+	}
+	normalized := NormalizePhoneNumber(identifier)
+	if strings.Trim(normalized, "+") == "" {
+		return nil, fmt.Errorf("recipient %q has no phone digits", identifier)
+	}
+	variants := GetPhoneVariants(normalized)
+	variants = append(variants, strings.TrimPrefix(normalized, "+"))
+	return variants, nil
 }
 
 // imageUTIs is the set of UTIs that represent image types.
 var imageUTIs = map[string]bool{
-	"public.jpeg":          true,
-	"public.png":           true,
-	"public.heic":          true,
-	"public.heif":          true,
-	"public.gif":           true,
-	"public.tiff":          true,
-	"public.bmp":           true,
-	"com.apple.icns":       true,
-	"public.webp":          true,
-	"com.compuserve.gif":   true,
-	"public.svg-image":     true,
-	"public.image":         true,
+	"public.jpeg":        true,
+	"public.png":         true,
+	"public.heic":        true,
+	"public.heif":        true,
+	"public.gif":         true,
+	"public.tiff":        true,
+	"public.bmp":         true,
+	"com.apple.icns":     true,
+	"public.webp":        true,
+	"com.compuserve.gif": true,
+	"public.svg-image":   true,
+	"public.image":       true,
 }
 
 // isImageMIME checks if a MIME type represents an image.
@@ -632,7 +666,7 @@ func GetAttachmentsForMessage(messageID int64) ([]Attachment, error) {
 		var totalBytes sql.NullInt64
 
 		if err := rows.Scan(&att.AttachmentID, &filename, &mimeType, &uti, &totalBytes); err != nil {
-			continue
+			return nil, fmt.Errorf("read attachment: %w", err)
 		}
 		att.Filename = filepath.Base(filename.String)
 		att.FilePath = expandAttachmentPath(filename.String)
@@ -643,7 +677,7 @@ func GetAttachmentsForMessage(messageID int64) ([]Attachment, error) {
 
 		attachments = append(attachments, att)
 	}
-	return attachments, nil
+	return attachments, rows.Err()
 }
 
 // GetAttachmentsForMessages retrieves attachments for multiple message IDs in a
@@ -693,7 +727,7 @@ func GetAttachmentsForMessages(messageIDs []int64) (map[int64][]Attachment, erro
 		var totalBytes sql.NullInt64
 
 		if err := rows.Scan(&msgID, &att.AttachmentID, &filename, &mimeType, &uti, &totalBytes); err != nil {
-			continue
+			return nil, fmt.Errorf("read attachment: %w", err)
 		}
 		att.Filename = filepath.Base(filename.String)
 		att.FilePath = expandAttachmentPath(filename.String)
@@ -704,7 +738,7 @@ func GetAttachmentsForMessages(messageIDs []int64) (map[int64][]Attachment, erro
 
 		result[msgID] = append(result[msgID], att)
 	}
-	return result, nil
+	return result, rows.Err()
 }
 
 // ResolveSender resolves a sender identifier to a display name.

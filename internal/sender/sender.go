@@ -7,10 +7,15 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/danewalton/imessage-cli/internal/database"
 )
 
 // SendMessage sends an iMessage to a recipient.
 func SendMessage(recipient, message string) error {
+	if strings.TrimSpace(recipient) == "" {
+		return fmt.Errorf("recipient must not be empty")
+	}
 	escapedMessage := escapeForAppleScript(message)
 	escapedRecipient := escapeForAppleScript(recipient)
 
@@ -29,35 +34,41 @@ func SendMessage(recipient, message string) error {
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
-		// Try alternative method
-		return sendMessageAlternative(recipient, message)
+		if ctx.Err() != nil {
+			return fmt.Errorf("send outcome unknown: %w; check Messages before retrying", ctx.Err())
+		}
+		return sendNewMessage(recipient, message)
 	}
 
 	_ = output
 	return nil
 }
 
-// sendMessageAlternative is an alternative method to send message using chat specifier.
-func sendMessageAlternative(recipient, message string) error {
-	escapedMessage := escapeForAppleScript(message)
-	escapedRecipient := escapeForAppleScript(recipient)
+// SendToConversation addresses an existing chat by its Messages GUID.
+func SendToConversation(conv database.Conversation, message string) error {
+	if conv.ChatGUID == "" {
+		return fmt.Errorf("conversation chat:%d has no Messages chat ID; cannot safely send", conv.ChatID)
+	}
+	return SendToChat(conv.ChatGUID, message)
+}
 
-	applescript := fmt.Sprintf(`
+// SendToChat sends to an exact Messages chat ID, never a name or participant.
+func SendToChat(chatGUID, message string) error {
+	if strings.TrimSpace(chatGUID) == "" {
+		return fmt.Errorf("Messages chat ID must not be empty")
+	}
+	script := fmt.Sprintf(`
 		tell application "Messages"
-			send "%s" to participant "%s" of (1st chat whose participants contains participant "%s")
+			set targetChat to chat id "%s"
+			send "%s" to targetChat
 		end tell
-	`, escapedMessage, escapedRecipient, escapedRecipient)
-
+	`, escapeForAppleScript(chatGUID), escapeForAppleScript(message))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "osascript", "-e", applescript)
-	_, err := cmd.CombinedOutput()
-
+	output, err := exec.CommandContext(ctx, "osascript", "-e", script).CombinedOutput()
 	if err != nil {
-		return sendNewMessage(recipient, message)
+		return fmt.Errorf("failed to send to chat: %w: %s", err, strings.TrimSpace(string(output)))
 	}
-
 	return nil
 }
 
@@ -83,7 +94,7 @@ func sendNewMessage(recipient, message string) error {
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
-		return fmt.Errorf("failed to send message: %s", string(output))
+		return fmt.Errorf("failed to send message: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 
 	return nil

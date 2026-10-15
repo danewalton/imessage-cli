@@ -7,16 +7,26 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/danewalton/imessage-cli/internal/database"
 	"github.com/danewalton/imessage-cli/internal/sender"
 	"github.com/danewalton/imessage-cli/internal/watcher"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
+
+type messageWatcher interface {
+	GetConversations(int) ([]watcher.Conversation, error)
+	GetMessages(int64, int) ([]watcher.Message, error)
+	OnNewMessages(watcher.MessageCallback)
+	OnConversationsUpdated(watcher.ConversationCallback)
+	OnError(watcher.ErrorCallback)
+	Start()
+	Stop()
+}
 
 // UI constants
 const (
@@ -40,14 +50,19 @@ type MessagesTUI struct {
 	statusBar  *tview.TextView
 	mainFlex   *tview.Flex
 
-	watcher         *watcher.MessageWatcher
+	watcher         messageWatcher
 	conversations   []watcher.Conversation
 	messages        []watcher.Message
 	selectedChatID  int64
 	selectedChatIdx int
 	previewModal    *tview.TextView
 
-	mu sync.RWMutex
+	rebuildingList bool
+	loadGeneration uint64
+	draftVersion   uint64
+	drafts         map[int64]string
+	failedDrafts   map[int64][]string
+	send           func(watcher.Conversation, string) error
 	// sendingMessage tracks whether a message send is in progress
 	sendingMessage atomic.Bool
 	// refreshing tracks whether a refresh is in progress
@@ -61,8 +76,62 @@ type MessagesTUI struct {
 // NewMessagesTUI creates a new TUI instance.
 func NewMessagesTUI() *MessagesTUI {
 	return &MessagesTUI{
-		watcher: watcher.NewMessageWatcher(500 * time.Millisecond),
+		watcher:      watcher.NewMessageWatcher(500 * time.Millisecond),
+		drafts:       make(map[int64]string),
+		failedDrafts: make(map[int64][]string),
+		send: func(conv watcher.Conversation, text string) error {
+			return sender.SendToConversation(database.Conversation{
+				ChatID: conv.ChatID, ChatGUID: conv.ChatGUID,
+			}, text)
+		},
 	}
+}
+
+func openDebugLog(logPath string) (*os.File, error) {
+	if logPath == "" {
+		cacheDir, err := os.UserCacheDir()
+		if err != nil {
+			return nil, err
+		}
+		dir := filepath.Join(cacheDir, "imessage-cli")
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return nil, err
+		}
+		info, err := os.Lstat(dir)
+		if err != nil {
+			return nil, err
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("debug log directory is not a directory: %s", dir)
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || stat.Uid != uint32(os.Geteuid()) {
+			return nil, fmt.Errorf("debug log directory is not owned by the current user")
+		}
+		if err := os.Chmod(dir, 0700); err != nil {
+			return nil, err
+		}
+		logPath = filepath.Join(dir, "tui.log")
+	}
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0600)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err == nil {
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !info.Mode().IsRegular() || !ok || stat.Uid != uint32(os.Geteuid()) || stat.Nlink != 1 {
+			err = fmt.Errorf("debug log must be a regular file owned only by the current user")
+		}
+	}
+	if err == nil {
+		err = f.Chmod(0600)
+	}
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
 }
 
 // acquireLock attempts to acquire an exclusive lock to prevent multiple instances.
@@ -110,16 +179,13 @@ func RunWithDebug(enable bool, logPath string) error {
 	t := NewMessagesTUI()
 	t.debug = enable
 	if enable {
-		if logPath == "" {
-			logPath = "/tmp/imessage-tui.log"
-		}
-		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		f, err := openDebugLog(logPath)
 		if err != nil {
 			return fmt.Errorf("unable to open log file: %w", err)
 		}
 		t.logFile = f
 		t.logger = log.New(f, "tui: ", log.LstdFlags|log.Lmicroseconds)
-		t.logf("debug logging enabled, file=%s", logPath)
+		t.logf("debug logging enabled, file=%s", f.Name())
 	}
 	defer func() {
 		if t.logFile != nil {
@@ -202,9 +268,16 @@ func (t *MessagesTUI) run() error {
 	// Setup watcher
 	t.watcher.OnNewMessages(t.onNewMessages)
 	t.watcher.OnConversationsUpdated(t.onConversationsUpdated)
+	t.watcher.OnError(func(err error) {
+		t.app.QueueUpdateDraw(func() {
+			t.setStatus(fmt.Sprintf("Database error: %v (check Full Disk Access)", err))
+		})
+	})
 
 	// Load initial data synchronously (before app.Run)
-	t.loadInitialData()
+	if err := t.loadInitialData(); err != nil {
+		return fmt.Errorf("load conversations: %w (check Full Disk Access)", err)
+	}
 
 	// Register UI callbacks after initial population to avoid triggering them
 	// while we're still populating the list (which can cause QueueUpdateDraw
@@ -243,20 +316,13 @@ func (t *MessagesTUI) setupCallbacks() {
 	}
 	// Conversation selection
 	t.convList.SetChangedFunc(func(index int, mainText, secondaryText string, shortcut rune) {
-		t.selectedChatIdx = index
-		t.mu.RLock()
-		if index >= 0 && index < len(t.conversations) {
-			conv := t.conversations[index]
-			t.selectedChatID = conv.ChatID
-			t.mu.RUnlock()
-			// Run in goroutine to avoid deadlock when called from within QueueUpdateDraw
-			go t.loadMessages(conv.ChatID)
-		} else {
-			t.mu.RUnlock()
+		if !t.rebuildingList {
+			t.selectConversation(index)
 		}
 	})
 
 	t.convList.SetSelectedFunc(func(index int, mainText, secondaryText string, shortcut rune) {
+		t.selectConversation(index)
 		t.app.SetFocus(t.msgView)
 		t.setStatus("[MSG] ↑↓:Scroll  h/←:Back  i:Input  p:Preview  r:Refresh  q:Quit")
 	})
@@ -267,7 +333,6 @@ func (t *MessagesTUI) setupCallbacks() {
 			text := t.inputField.GetText()
 			if text != "" {
 				t.sendMessage(text)
-				t.inputField.SetText("")
 			}
 			// Keep focus on the input field so the user can keep typing
 			t.app.SetFocus(t.inputField)
@@ -276,19 +341,24 @@ func (t *MessagesTUI) setupCallbacks() {
 			t.setStatus("[MSG] ↑↓:Scroll  h/←:Back  i:Input  p:Preview  r:Refresh  q:Quit")
 		}
 	})
+	t.inputField.SetChangedFunc(func(text string) {
+		t.draftVersion++
+		if t.selectedChatID != 0 {
+			t.drafts[t.selectedChatID] = text
+		}
+	})
 
 	// Global key handling
 	t.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		focused := t.app.GetFocus()
 		if t.logger != nil {
-			// Log basic input event info for debugging frozen UI issues
-			var r rune
-			if event != nil {
-				r = event.Rune()
-			}
-			t.logf("input event: key=%v rune=%q focused=%T", event.Key(), r, focused)
+			t.logf("input event: key=%v focused=%T", event.Key(), focused)
 		}
 
+		if event.Key() == tcell.KeyCtrlR {
+			t.recoverFailedDraft()
+			return nil
+		}
 		// Handle input field separately
 		if focused == t.inputField {
 			return event
@@ -312,7 +382,7 @@ func (t *MessagesTUI) setupCallbacks() {
 				return nil
 			case 'i':
 				t.app.SetFocus(t.inputField)
-				t.setStatus("[INPUT] Enter:Send  Esc:Cancel")
+				t.setStatus("[INPUT] Enter:Send  Esc:Back  Ctrl+R:Recover failed message")
 				return nil
 			case 'r', 'R':
 				t.refresh()
@@ -384,14 +454,7 @@ func (t *MessagesTUI) setupCallbacks() {
 }
 
 func (t *MessagesTUI) setStatus(msg string) {
-	t.statusBar.SetText(" " + msg + " ")
-}
-
-// setStatusAndDraw updates the status bar and forces an immediate redraw.
-// Use this when calling from the main event loop to ensure the status is visible.
-func (t *MessagesTUI) setStatusAndDraw(msg string) {
-	t.statusBar.SetText(" " + msg + " ")
-	t.app.Draw()
+	t.statusBar.SetText(" " + tview.Escape(msg) + " ")
 }
 
 func (t *MessagesTUI) logf(format string, v ...interface{}) {
@@ -401,381 +464,274 @@ func (t *MessagesTUI) logf(format string, v ...interface{}) {
 }
 
 // loadInitialData loads data synchronously before the app starts
-func (t *MessagesTUI) loadInitialData() {
-	convs := t.watcher.GetConversations(DefaultConversationLimit)
-
-	if t.logger != nil {
-		t.logf("loadInitialData: got %d conversations", len(convs))
+func (t *MessagesTUI) loadInitialData() error {
+	convs, err := t.watcher.GetConversations(DefaultConversationLimit)
+	if err != nil {
+		return err
 	}
+	if len(convs) > 0 {
+		t.selectedChatID = convs[0].ChatID
+		t.messages, err = t.watcher.GetMessages(t.selectedChatID, DefaultMessageLimit)
+		if err != nil {
+			return err
+		}
+	}
+	t.applyConversations(convs)
+	t.renderMessages()
+	return nil
+}
 
-	t.mu.Lock()
+// List and selection changes run on the UI thread, or before Run starts.
+func (t *MessagesTUI) applyConversations(convs []watcher.Conversation) bool {
+	selected := 0
+	for i, conv := range convs {
+		if conv.ChatID == t.selectedChatID {
+			selected = i
+			break
+		}
+	}
 	t.conversations = convs
-	t.mu.Unlock()
-
-	// Populate UI directly (no QueueUpdateDraw needed before Run())
+	t.rebuildingList = true
 	t.convList.Clear()
 	for _, conv := range convs {
-		name := conv.DisplayName
-		if len(name) > MaxDisplayNameLength {
-			name = name[:MaxDisplayNameLength-3] + "..."
-		}
-
-		secondary := t.formatTime(conv.LastMessageDate)
+		name := truncateName(conv.DisplayName, MaxDisplayNameLength)
 		if conv.UnreadCount > 0 {
 			name = fmt.Sprintf("(%d) %s", conv.UnreadCount, name)
 		}
-
-		t.convList.AddItem(name, secondary, 0, nil)
+		t.convList.AddItem(tview.Escape(name), t.formatTime(conv.LastMessageDate), 0, nil)
 	}
-
-	// Load first conversation's messages
 	if len(convs) > 0 {
-		t.selectedChatID = convs[0].ChatID
-		msgs := t.watcher.GetMessages(convs[0].ChatID, DefaultMessageLimit)
-
-		t.mu.Lock()
-		t.messages = msgs
-		t.mu.Unlock()
-
-		t.msgView.SetTitle(fmt.Sprintf(" %s ", convs[0].DisplayName))
-
-		if msgs == nil {
-			t.msgView.SetText("[yellow]No messages or unable to load messages[-]")
-		} else {
-			var builder strings.Builder
-			for _, msg := range msgs {
-				t.formatMessageLine(&builder, msg)
-			}
-			t.msgView.SetText(builder.String())
-		}
+		t.convList.SetCurrentItem(selected)
 	} else {
-		t.msgView.SetText("[yellow]No conversations found. Make sure Messages is configured and Full Disk Access is granted.[-]")
+		selected = -1
 	}
+	t.rebuildingList = false
+	return t.selectConversation(selected)
 }
 
-func (t *MessagesTUI) loadConversations() {
-	convs := t.watcher.GetConversations(DefaultConversationLimit)
+func (t *MessagesTUI) selectConversation(index int) bool {
+	var conv watcher.Conversation
+	if index >= 0 && index < len(t.conversations) {
+		conv = t.conversations[index]
+	}
+	t.selectedChatIdx = index
+	t.inputField.SetLabel("Send: ")
+	if conv.ChatID != 0 {
+		t.inputField.SetLabel("To " + tview.Escape(truncateName(conv.DisplayName, MaxDisplayNameLength)) + ": ")
+	}
+	if conv.ChatID == t.selectedChatID {
+		return false
+	}
+	if t.selectedChatID != 0 {
+		t.drafts[t.selectedChatID] = t.inputField.GetText()
+	}
+	t.selectedChatID = conv.ChatID
+	t.loadGeneration++
+	t.messages = nil
+	t.inputField.SetText(t.drafts[conv.ChatID])
+	t.renderMessages()
+	if conv.ChatID != 0 {
+		t.loadMessages(conv.ChatID)
+	}
+	return true
+}
 
-	t.mu.Lock()
-	t.conversations = convs
-	t.mu.Unlock()
+func truncateName(text string, limit int) string {
+	runes := []rune(text)
+	if len(runes) > limit {
+		return string(runes[:limit-3]) + "..."
+	}
+	return text
+}
 
-	t.app.QueueUpdateDraw(func() {
-		t.convList.Clear()
-		for _, conv := range convs {
-			name := conv.DisplayName
-			if len(name) > MaxDisplayNameLength {
-				name = name[:MaxDisplayNameLength-3] + "..."
-			}
-
-			secondary := t.formatTime(conv.LastMessageDate)
-			if conv.UnreadCount > 0 {
-				name = fmt.Sprintf("(%d) %s", conv.UnreadCount, name)
-			}
-
-			t.convList.AddItem(name, secondary, 0, nil)
+func (t *MessagesTUI) renderMessages() {
+	t.msgView.SetTitle(" Messages ")
+	for _, conv := range t.conversations {
+		if conv.ChatID == t.selectedChatID {
+			t.msgView.SetTitle(" " + tview.Escape(conv.DisplayName) + " ")
+			break
 		}
-
-		if len(convs) > 0 && t.selectedChatID == 0 {
-			t.selectedChatID = convs[0].ChatID
-			// Run in goroutine to avoid deadlock from nested QueueUpdateDraw
-			go t.loadMessages(convs[0].ChatID)
-		}
-	})
+	}
+	if t.selectedChatID == 0 {
+		t.msgView.SetText("[yellow]No conversations found.[-]")
+		return
+	}
+	if len(t.messages) == 0 {
+		t.msgView.SetText("[yellow]No messages in this conversation.[-]")
+		return
+	}
+	var builder strings.Builder
+	for _, msg := range t.messages {
+		t.formatMessageLine(&builder, msg)
+	}
+	t.msgView.SetText(builder.String())
+	t.msgView.ScrollToEnd()
 }
 
 func (t *MessagesTUI) loadMessages(chatID int64) {
-	// Show loading indicator
-	t.app.QueueUpdateDraw(func() {
-		t.msgView.SetText("[yellow]Loading messages...[-]")
-	})
-
-	msgs := t.watcher.GetMessages(chatID, DefaultMessageLimit)
-
-	t.mu.Lock()
-	t.messages = msgs
-	t.selectedChatID = chatID
-	t.mu.Unlock()
-
-	// Find conversation name
-	var chatName string
-	t.mu.RLock()
-	for _, conv := range t.conversations {
-		if conv.ChatID == chatID {
-			chatName = conv.DisplayName
-			break
-		}
-	}
-	t.mu.RUnlock()
-
-	t.app.QueueUpdateDraw(func() {
-		t.msgView.Clear()
-		t.msgView.SetTitle(fmt.Sprintf(" %s ", chatName))
-
-		if msgs == nil {
-			t.msgView.SetText("[red]Unable to load messages[-]")
-			return
-		}
-
-		var builder strings.Builder
-		for _, msg := range msgs {
-			t.formatMessageLine(&builder, msg)
-		}
-		t.msgView.SetText(builder.String())
-		t.msgView.ScrollToEnd()
-	})
-}
-
-func (t *MessagesTUI) sendMessage(text string) {
-	// Prevent multiple concurrent sends
-	if !t.sendingMessage.CompareAndSwap(false, true) {
-		t.app.QueueUpdateDraw(func() {
-			t.setStatus("⏳ Already sending a message...")
-		})
+	if chatID == 0 || chatID != t.selectedChatID {
 		return
 	}
-
-	t.mu.RLock()
-	chatID := t.selectedChatID
-	var chatIdent string
-	for _, conv := range t.conversations {
-		if conv.ChatID == chatID {
-			chatIdent = conv.ChatIdentifier
-			break
-		}
-	}
-	t.mu.RUnlock()
-
-	if chatIdent == "" {
-		t.sendingMessage.Store(false)
-		t.app.QueueUpdateDraw(func() {
-			t.setStatus("Error: No conversation selected")
-		})
-		return
-	}
-
-	// Run async to avoid blocking UI (AppleScript can take up to 30s)
+	t.loadGeneration++
+	generation := t.loadGeneration
 	go func() {
-		defer t.sendingMessage.Store(false)
-
-		t.app.QueueUpdateDraw(func() {
-			t.setStatus("📤 Sending...")
-		})
-
-		err := sender.SendMessage(chatIdent, text)
-		if err != nil {
-			t.app.QueueUpdateDraw(func() {
-				t.setStatus(fmt.Sprintf("❌ Error: %v", err))
-				// Restore the message text so user can retry
-				t.inputField.SetText(text)
-			})
-		} else {
-			t.app.QueueUpdateDraw(func() {
-				t.setStatus("✓ Message sent!")
-			})
-			// Refresh messages after a short delay
-			time.Sleep(MessageRefreshDelay)
-			t.loadMessages(chatID)
+		type result struct {
+			messages []watcher.Message
+			err      error
 		}
+		results := make(chan result, 1)
+		go func() {
+			msgs, err := t.watcher.GetMessages(chatID, DefaultMessageLimit)
+			results <- result{msgs, err}
+		}()
+		var res result
+		select {
+		case res = <-results:
+		case <-time.After(5 * time.Second):
+			res.err = fmt.Errorf("message load timed out; database may be busy")
+		}
+		t.app.QueueUpdateDraw(func() {
+			t.applyMessages(chatID, generation, res.messages, res.err)
+		})
 	}()
 }
 
-func (t *MessagesTUI) refresh() {
-	t.logf("refresh: called")
-
-	// Prevent concurrent refreshes
-	if !t.refreshing.CompareAndSwap(false, true) {
-		t.logf("refresh: already refreshing, skipping")
+func (t *MessagesTUI) applyMessages(chatID int64, generation uint64, msgs []watcher.Message, err error) {
+	// A slow read must not replace a newer selection or refresh.
+	if chatID != t.selectedChatID || generation != t.loadGeneration {
 		return
 	}
+	if err != nil {
+		t.setStatus(fmt.Sprintf("Unable to load messages: %v", err))
+		if len(t.messages) == 0 {
+			t.msgView.SetText("[red]" + tview.Escape(err.Error()) + "[-]")
+		}
+		return
+	}
+	t.messages = msgs
+	t.renderMessages()
+}
 
-	t.logf("refresh: acquired refresh lock")
-
-	// Update status text; the screen redraws automatically after the input
-	// handler returns, so calling Draw() here would deadlock.
-	t.setStatus("🔄 Refreshing...")
-
-	// Run refresh in goroutine to avoid blocking UI
+func (t *MessagesTUI) sendMessage(text string) bool {
+	if !t.sendingMessage.CompareAndSwap(false, true) {
+		t.setStatus("Already sending a message; your draft is unchanged")
+		return false
+	}
+	chatID := t.selectedChatID
+	var target watcher.Conversation
+	for _, conv := range t.conversations {
+		if conv.ChatID == chatID {
+			target = conv
+			break
+		}
+	}
+	if target.ChatID == 0 {
+		t.sendingMessage.Store(false)
+		t.setStatus("Error: No conversation selected; your draft is unchanged")
+		return false
+	}
+	t.inputField.SetText("")
+	version := t.draftVersion
+	t.setStatus("Sending to " + target.DisplayName + "...")
 	go func() {
-		defer func() {
-			t.refreshing.Store(false)
-			t.logf("refresh: released refresh lock")
-		}()
-
-		t.logf("refresh: goroutine started, fetching conversations...")
-
-		// Use channels to fetch data with timeout
-		type convResult struct {
-			convs []watcher.Conversation
-		}
-		type msgResult struct {
-			msgs []watcher.Message
-		}
-
-		convCh := make(chan convResult, 1)
-		go func() {
-			t.logf("refresh: calling GetConversations...")
-			result := t.watcher.GetConversations(DefaultConversationLimit)
-			t.logf("refresh: GetConversations returned %d items", len(result))
-			convCh <- convResult{convs: result}
-		}()
-
-		// Wait for conversations with timeout
-		var convs []watcher.Conversation
-		select {
-		case res := <-convCh:
-			convs = res.convs
-			t.logf("refresh: received conversations from channel")
-		case <-time.After(5 * time.Second):
-			t.logf("refresh: TIMEOUT waiting for conversations")
+		err := t.send(target, text)
+		t.app.QueueUpdateDraw(func() {
+			t.finishSend(chatID, target.DisplayName, text, version, err)
+		})
+		if err == nil {
+			time.Sleep(MessageRefreshDelay)
 			t.app.QueueUpdateDraw(func() {
-				t.setStatus("⚠️ Refresh timeout - database may be busy")
+				t.loadMessages(chatID)
 			})
-			return
 		}
+	}()
+	return true
+}
 
-		t.mu.Lock()
-		t.conversations = convs
-		chatID := t.selectedChatID
-		t.mu.Unlock()
+func (t *MessagesTUI) finishSend(chatID int64, name, text string, version uint64, err error) {
+	t.sendingMessage.Store(false)
+	if err == nil {
+		t.setStatus("Message sent to " + name)
+		return
+	}
+	// An empty composer may still have been edited and cleared since submission.
+	if t.selectedChatID == chatID && t.draftVersion == version && t.inputField.GetText() == "" {
+		t.inputField.SetText(text)
+		t.setStatus(fmt.Sprintf("Send to %s failed: %v; draft restored", name, err))
+		return
+	}
+	t.failedDrafts[chatID] = append(t.failedDrafts[chatID], text)
+	t.setStatus(fmt.Sprintf("Send to %s failed: %v; select that chat and use Ctrl+R to recover", name, err))
+}
 
-		t.logf("refresh: got %d convs, chatID=%d, fetching messages...", len(convs), chatID)
+func (t *MessagesTUI) recoverFailedDraft() {
+	if t.inputField.GetText() != "" {
+		t.setStatus("Send or clear the current draft before recovering a failed message")
+		return
+	}
+	failed := t.failedDrafts[t.selectedChatID]
+	if len(failed) == 0 {
+		t.setStatus("No failed messages to recover in this conversation")
+		return
+	}
+	t.inputField.SetText(failed[0])
+	t.failedDrafts[t.selectedChatID] = failed[1:]
+	t.app.SetFocus(t.inputField)
+	t.setStatus("Failed message recovered; review it before pressing Enter")
+}
 
-		// Fetch messages before updating UI (if we have a selected chat)
-		var msgs []watcher.Message
-		var chatName string
-		if chatID > 0 {
-			msgCh := make(chan msgResult, 1)
-			go func() {
-				t.logf("refresh: calling GetMessages for chatID=%d...", chatID)
-				result := t.watcher.GetMessages(chatID, DefaultMessageLimit)
-				t.logf("refresh: GetMessages returned %d items", len(result))
-				msgCh <- msgResult{msgs: result}
-			}()
-
-			// Wait for messages with timeout
-			select {
-			case res := <-msgCh:
-				msgs = res.msgs
-				t.logf("refresh: received messages from channel")
-			case <-time.After(5 * time.Second):
-				t.logf("refresh: TIMEOUT waiting for messages")
-				t.app.QueueUpdateDraw(func() {
-					t.setStatus("⚠️ Message load timeout - database may be busy")
-				})
+func (t *MessagesTUI) refresh() {
+	if !t.refreshing.CompareAndSwap(false, true) {
+		return
+	}
+	t.setStatus("Refreshing...")
+	go func() {
+		type result struct {
+			convs []watcher.Conversation
+			err   error
+		}
+		results := make(chan result, 1)
+		go func() {
+			convs, err := t.watcher.GetConversations(DefaultConversationLimit)
+			results <- result{convs, err}
+		}()
+		var res result
+		select {
+		case res = <-results:
+		case <-time.After(5 * time.Second):
+			res.err = fmt.Errorf("refresh timed out; database may be busy")
+		}
+		t.app.QueueUpdateDraw(func() {
+			t.refreshing.Store(false)
+			if res.err != nil {
+				t.setStatus("Refresh failed: " + res.err.Error())
 				return
 			}
-
-			t.mu.Lock()
-			t.messages = msgs
-			t.mu.Unlock()
-
-			// Find conversation name
-			t.mu.RLock()
-			for _, conv := range t.conversations {
-				if conv.ChatID == chatID {
-					chatName = conv.DisplayName
-					break
-				}
+			if !t.applyConversations(res.convs) {
+				t.loadMessages(t.selectedChatID)
 			}
-			t.mu.RUnlock()
-		}
-
-		t.logf("refresh: calling QueueUpdateDraw to update UI...")
-
-		// Single QueueUpdateDraw call to update all UI elements atomically
-		t.app.QueueUpdateDraw(func() {
-			t.logf("refresh: inside QueueUpdateDraw callback")
-			// Update conversation list
-			t.convList.Clear()
-			for _, conv := range convs {
-				name := conv.DisplayName
-				if len(name) > MaxDisplayNameLength {
-					name = name[:MaxDisplayNameLength-3] + "..."
-				}
-
-				secondary := t.formatTime(conv.LastMessageDate)
-				if conv.UnreadCount > 0 {
-					name = fmt.Sprintf("(%d) %s", conv.UnreadCount, name)
-				}
-
-				t.convList.AddItem(name, secondary, 0, nil)
-			}
-
-			// Update messages if we have a selected chat
-			if chatID > 0 && msgs != nil {
-				t.msgView.Clear()
-				t.msgView.SetTitle(fmt.Sprintf(" %s ", chatName))
-
-				var builder strings.Builder
-				for _, msg := range msgs {
-					t.formatMessageLine(&builder, msg)
-				}
-				t.msgView.SetText(builder.String())
-				t.msgView.ScrollToEnd()
-			}
-
-			t.setStatus("✓ Refreshed!")
-			t.logf("refresh: QueueUpdateDraw callback complete")
+			t.setStatus("Conversations refreshed")
 		})
-		t.logf("refresh: QueueUpdateDraw returned")
 	}()
 }
 
 func (t *MessagesTUI) onNewMessages(msgs []watcher.Message) {
-	if t.logger != nil {
-		t.logf("onNewMessages: received %d messages", len(msgs))
-	}
-	t.mu.RLock()
-	currentChatID := t.selectedChatID
-	t.mu.RUnlock()
-
-	// Check if any messages are for the current chat
-	for _, msg := range msgs {
-		if msg.ChatID == currentChatID {
-			t.loadMessages(currentChatID)
-			break
+	t.app.QueueUpdateDraw(func() {
+		for _, msg := range msgs {
+			if msg.ChatID == t.selectedChatID {
+				t.loadMessages(t.selectedChatID)
+				break
+			}
 		}
-	}
-
-	// Show notification for incoming messages
-	if len(msgs) > 0 && !msgs[len(msgs)-1].IsFromMe {
-		t.app.QueueUpdateDraw(func() {
-			t.setStatus(fmt.Sprintf("📬 New message from %s", msgs[len(msgs)-1].Sender))
-		})
-	}
+		if len(msgs) > 0 && !msgs[len(msgs)-1].IsFromMe {
+			t.setStatus("New message from " + msgs[len(msgs)-1].Sender)
+		}
+	})
 }
 
 func (t *MessagesTUI) onConversationsUpdated(convs []watcher.Conversation) {
-	if t.logger != nil {
-		t.logf("onConversationsUpdated: got %d convs", len(convs))
-	}
-	t.mu.Lock()
-	t.conversations = convs
-	t.mu.Unlock()
-
 	t.app.QueueUpdateDraw(func() {
-		// Preserve selection
-		selectedIdx := t.convList.GetCurrentItem()
-
-		t.convList.Clear()
-		for _, conv := range convs {
-			name := conv.DisplayName
-			if len(name) > MaxDisplayNameLength {
-				name = name[:MaxDisplayNameLength-3] + "..."
-			}
-
-			secondary := t.formatTime(conv.LastMessageDate)
-			if conv.UnreadCount > 0 {
-				name = fmt.Sprintf("(%d) %s", conv.UnreadCount, name)
-			}
-
-			t.convList.AddItem(name, secondary, 0, nil)
-		}
-
-		if selectedIdx >= 0 && selectedIdx < len(convs) {
-			t.convList.SetCurrentItem(selectedIdx)
-		}
+		t.applyConversations(convs)
 	})
 }
 
@@ -801,21 +757,18 @@ func (t *MessagesTUI) formatTime(tm *time.Time) string {
 func (t *MessagesTUI) formatMessageLine(builder *strings.Builder, msg watcher.Message) {
 	timeStr := t.formatTime(msg.Date)
 	if msg.IsFromMe {
-		builder.WriteString(fmt.Sprintf("[green][%s] Me:[-] %s\n", timeStr, msg.Text))
+		builder.WriteString(fmt.Sprintf("[green][%s] Me:[-] %s\n", timeStr, tview.Escape(msg.Text)))
 	} else {
-		sender := msg.Sender
-		if len(sender) > MaxSenderNameLength {
-			sender = sender[:MaxSenderNameLength-3] + "..."
-		}
-		builder.WriteString(fmt.Sprintf("[cyan][%s] %s:[-] %s\n", timeStr, sender, msg.Text))
+		name := truncateName(msg.Sender, MaxSenderNameLength)
+		builder.WriteString(fmt.Sprintf("[cyan][%s] %s:[-] %s\n", timeStr, tview.Escape(name), tview.Escape(msg.Text)))
 	}
 
 	// Show attachment indicators
 	for _, att := range msg.Attachments {
 		if att.IsImage {
-			builder.WriteString(fmt.Sprintf("              [yellow]📎 %s (image · p to preview)[-]\n", att.Filename))
+			builder.WriteString(fmt.Sprintf("              [yellow]📎 %s (image · p to preview)[-]\n", tview.Escape(att.Filename)))
 		} else {
-			builder.WriteString(fmt.Sprintf("              [gray]📎 %s[-]\n", att.Filename))
+			builder.WriteString(fmt.Sprintf("              [gray]📎 %s[-]\n", tview.Escape(att.Filename)))
 		}
 	}
 }
@@ -861,7 +814,7 @@ func (t *MessagesTUI) showImagePreview(att watcher.Attachment) {
 				})
 			}
 
-			title := fmt.Sprintf(" 🖼️  %s (Esc to close) ", att.Filename)
+			title := fmt.Sprintf(" 🖼️  %s (Esc to close) ", tview.Escape(att.Filename))
 			t.previewModal.SetTitle(title)
 			t.previewModal.SetText(rendered)
 			t.previewModal.ScrollToBeginning()
@@ -885,9 +838,6 @@ func (t *MessagesTUI) showImagePreview(att watcher.Attachment) {
 // findNearestImageAttachment scans messages for the nearest image attachment,
 // searching backwards from the most recent message.
 func (t *MessagesTUI) findNearestImageAttachment() *watcher.Attachment {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
 	// Search from newest to oldest
 	for i := len(t.messages) - 1; i >= 0; i-- {
 		for _, att := range t.messages[i].Attachments {

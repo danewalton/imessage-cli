@@ -46,6 +46,7 @@ type Message struct {
 // Conversation represents a conversation for the watcher.
 type Conversation struct {
 	ChatID          int64
+	ChatGUID        string
 	ChatIdentifier  string
 	DisplayName     string
 	Service         string
@@ -109,18 +110,21 @@ func (w *MessageWatcher) OnError(callback ErrorCallback) {
 	w.errorCallbacks = append(w.errorCallbacks, callback)
 }
 
-func (w *MessageWatcher) getLastMessageID() int64 {
+func (w *MessageWatcher) getLastMessageID() (int64, error) {
 	db, err := database.DB()
 	if err != nil {
-		return 0
+		return 0, err
 	}
 
 	var maxID sql.NullInt64
 	err = db.QueryRow("SELECT MAX(ROWID) FROM message").Scan(&maxID)
-	if err != nil || !maxID.Valid {
-		return 0
+	if err != nil {
+		return 0, err
 	}
-	return maxID.Int64
+	if !maxID.Valid {
+		return 0, nil
+	}
+	return maxID.Int64, nil
 }
 
 func (w *MessageWatcher) getDBMtime() int64 {
@@ -147,16 +151,17 @@ func (w *MessageWatcher) getDBMtime() int64 {
 }
 
 // GetConversations returns a list of conversations.
-func (w *MessageWatcher) GetConversations(limit int) []Conversation {
+func (w *MessageWatcher) GetConversations(limit int) ([]Conversation, error) {
 	convs, err := database.GetConversations(limit)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 
 	var result []Conversation
 	for _, c := range convs {
 		result = append(result, Conversation{
 			ChatID:          c.ChatID,
+			ChatGUID:        c.ChatGUID,
 			ChatIdentifier:  c.ChatIdentifier,
 			DisplayName:     c.DisplayName,
 			Service:         c.Service,
@@ -166,14 +171,14 @@ func (w *MessageWatcher) GetConversations(limit int) []Conversation {
 			Participants:    c.Participants,
 		})
 	}
-	return result
+	return result, nil
 }
 
 // GetMessages returns messages for a specific chat.
-func (w *MessageWatcher) GetMessages(chatID int64, limit int) []Message {
+func (w *MessageWatcher) GetMessages(chatID int64, limit int) ([]Message, error) {
 	msgs, err := database.GetMessages(chatID, "", limit)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 
 	var result []Message
@@ -202,15 +207,14 @@ func (w *MessageWatcher) GetMessages(chatID int64, limit int) []Message {
 		}
 		result = append(result, msg)
 	}
-	return result
+	return result, nil
 }
 
 // GetNewMessages returns messages newer than the given ID.
-func (w *MessageWatcher) GetNewMessages(sinceID int64) []Message {
+func (w *MessageWatcher) GetNewMessages(sinceID int64) ([]Message, error) {
 	db, err := database.DB()
 	if err != nil {
-		w.notifyError(err)
-		return nil
+		return nil, err
 	}
 
 	query := `
@@ -235,7 +239,7 @@ func (w *MessageWatcher) GetNewMessages(sinceID int64) []Message {
 
 	rows, err := db.Query(query, sinceID)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	defer rows.Close()
 
@@ -249,7 +253,7 @@ func (w *MessageWatcher) GetNewMessages(sinceID int64) []Message {
 
 		err := rows.Scan(&m.MessageID, &text, &attributedBody, &date, &isFromMe, &isRead, &senderID, &m.ChatID, &chatIdent, &chatName)
 		if err != nil {
-			continue
+			return nil, err
 		}
 
 		m.IsFromMe = isFromMe == 1
@@ -278,7 +282,7 @@ func (w *MessageWatcher) GetNewMessages(sinceID int64) []Message {
 		messages = append(messages, m)
 	}
 
-	return messages
+	return messages, rows.Err()
 }
 
 func (w *MessageWatcher) pollLoop() {
@@ -301,11 +305,19 @@ func (w *MessageWatcher) poll() {
 	// Always check for new messages by comparing the max message ROWID.
 	// This is a cheap query and avoids relying solely on file mtime which
 	// can miss changes when SQLite WAL mode is in use.
-	currentMaxID := w.getLastMessageID()
+	currentMaxID, err := w.getLastMessageID()
+	if err != nil {
+		w.notifyError(err)
+		return
+	}
 	lastID := w.lastMessageID.Load()
 
 	if currentMaxID > lastID {
-		newMessages := w.GetNewMessages(lastID)
+		newMessages, err := w.GetNewMessages(lastID)
+		if err != nil {
+			w.notifyError(err)
+			return
+		}
 		w.lastMessageID.Store(currentMaxID)
 
 		if len(newMessages) > 0 {
@@ -335,9 +347,12 @@ func (w *MessageWatcher) poll() {
 	lastMtime := w.lastMtime.Load()
 
 	if currentMtime > lastMtime {
+		conversations, err := w.GetConversations(DefaultConversationLimit)
+		if err != nil {
+			w.notifyError(err)
+			return
+		}
 		w.lastMtime.Store(currentMtime)
-
-		conversations := w.GetConversations(DefaultConversationLimit)
 		w.mu.RLock()
 		callbacks := make([]ConversationCallback, len(w.conversationCallbacks))
 		copy(callbacks, w.conversationCallbacks)
@@ -383,7 +398,12 @@ func (w *MessageWatcher) Start() {
 	w.wg.Add(1)
 	go func() {
 		// Initialize last IDs / mtime inside goroutine using atomic operations
-		w.lastMessageID.Store(w.getLastMessageID())
+		id, err := w.getLastMessageID()
+		if err != nil {
+			w.notifyError(err)
+		} else {
+			w.lastMessageID.Store(id)
+		}
 		w.lastMtime.Store(w.getDBMtime())
 
 		w.pollLoop()
