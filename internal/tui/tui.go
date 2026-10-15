@@ -608,8 +608,16 @@ func (t *MessagesTUI) applyMessages(chatID int64, generation uint64, msgs []watc
 		}
 		return
 	}
+	sameWindow := len(t.messages) == len(msgs)
+	for i := 0; sameWindow && i < len(msgs); i++ {
+		sameWindow = t.messages[i].MessageID == msgs[i].MessageID && t.messages[i].GUID == msgs[i].GUID
+	}
+	row, column := t.msgView.GetScrollOffset()
 	t.messages = msgs
 	t.renderMessages()
+	if sameWindow {
+		t.msgView.ScrollTo(row, column)
+	}
 }
 
 func (t *MessagesTUI) sendMessage(text string) bool {
@@ -724,14 +732,22 @@ func (t *MessagesTUI) onNewMessages(msgs []watcher.Message) {
 			}
 		}
 		if len(msgs) > 0 && !msgs[len(msgs)-1].IsFromMe {
-			t.setStatus("New message from " + msgs[len(msgs)-1].Sender)
+			last := msgs[len(msgs)-1]
+			if last.IsReaction {
+				t.setStatus("Reaction updated by " + last.Sender)
+			} else {
+				t.setStatus("New message from " + last.Sender)
+			}
 		}
 	})
 }
 
 func (t *MessagesTUI) onConversationsUpdated(convs []watcher.Conversation) {
 	t.app.QueueUpdateDraw(func() {
-		t.applyConversations(convs)
+		if !t.applyConversations(convs) {
+			// Removing a Tapback can delete its row without creating a new ROWID.
+			t.loadMessages(t.selectedChatID)
+		}
 	})
 }
 
@@ -755,6 +771,9 @@ func (t *MessagesTUI) formatTime(tm *time.Time) string {
 
 // formatMessageLine renders a single message (with attachment info) into the builder.
 func (t *MessagesTUI) formatMessageLine(builder *strings.Builder, msg watcher.Message) {
+	if msg.IsReaction {
+		return
+	}
 	timeStr := t.formatTime(msg.Date)
 	if msg.IsFromMe {
 		builder.WriteString(fmt.Sprintf("[green][%s] Me:[-] %s\n", timeStr, tview.Escape(msg.Text)))
@@ -770,6 +789,21 @@ func (t *MessagesTUI) formatMessageLine(builder *strings.Builder, msg watcher.Me
 		} else {
 			builder.WriteString(fmt.Sprintf("              [gray]📎 %s[-]\n", tview.Escape(att.Filename)))
 		}
+	}
+	if len(msg.Reactions) > 0 {
+		builder.WriteString("              [gray]")
+		for i, reaction := range msg.Reactions {
+			if i > 0 {
+				builder.WriteString("  ")
+			}
+			builder.WriteString(tview.Escape(reaction.Label() + " " + truncateName(reaction.Sender, MaxSenderNameLength)))
+			if reaction.Part < 0 {
+				builder.WriteString(" (bubble)")
+			} else if reaction.Part > 0 || len(msg.Attachments) > 0 {
+				fmt.Fprintf(builder, " (part %d)", reaction.Part+1)
+			}
+		}
+		builder.WriteString("[-]\n")
 	}
 }
 

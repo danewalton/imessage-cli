@@ -37,6 +37,18 @@ func Database(t *testing.T) *sql.DB {
 	return db
 }
 
+// ReactionSchema extends the minimal fixture after its positional inserts.
+func ReactionSchema(t *testing.T, db *sql.DB) {
+	t.Helper()
+	Exec(t, db, `
+		ALTER TABLE message ADD COLUMN guid TEXT;
+		ALTER TABLE message ADD COLUMN associated_message_guid TEXT;
+		ALTER TABLE message ADD COLUMN associated_message_type INTEGER DEFAULT 0;
+		ALTER TABLE message ADD COLUMN associated_message_emoji TEXT;
+		UPDATE message SET guid = printf('message-%d', ROWID);
+	`)
+}
+
 func Exec(t *testing.T, db *sql.DB, query string, args ...any) {
 	t.Helper()
 	if _, err := db.Exec(query, args...); err != nil {

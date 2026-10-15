@@ -132,6 +132,14 @@ func TestDatabaseRegressions(t *testing.T) {
 		if msgs[1].MessageID != 2 || msgs[1].Text != "meeting" {
 			t.Fatalf("read/search mismatch: %+v", msgs)
 		}
+		events, err := GetMessagesSince(0)
+		if err != nil || len(events) != 5 || events[1].Text != "meeting" || events[1].IsReaction {
+			t.Fatalf("legacy schema incremental decoding: %+v, %v", events, err)
+		}
+	})
+
+	t.Run("reaction snapshots", func(t *testing.T) {
+		testReactionSnapshots(t, db)
 	})
 
 	t.Run("attachment query errors propagate", func(t *testing.T) {

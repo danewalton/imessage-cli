@@ -32,6 +32,7 @@ type Attachment struct {
 // Message represents an iMessage for the watcher.
 type Message struct {
 	MessageID      int64
+	GUID           string
 	Text           string
 	Date           *time.Time
 	IsFromMe       bool
@@ -41,6 +42,8 @@ type Message struct {
 	ChatIdentifier string
 	ChatName       string
 	Attachments    []Attachment
+	Reactions      []database.Reaction
+	IsReaction     bool
 }
 
 // Conversation represents a conversation for the watcher.
@@ -56,7 +59,7 @@ type Conversation struct {
 	Participants    []string
 }
 
-// MessageCallback is called when new messages arrive.
+// MessageCallback includes reaction events as well as new messages.
 type MessageCallback func([]Message)
 
 // ConversationCallback is called when conversations are updated.
@@ -181,10 +184,15 @@ func (w *MessageWatcher) GetMessages(chatID int64, limit int) ([]Message, error)
 		return nil, err
 	}
 
+	return messagesFromDatabase(msgs), nil
+}
+
+func messagesFromDatabase(msgs []database.Message) []Message {
 	var result []Message
 	for _, m := range msgs {
 		msg := Message{
 			MessageID:      m.MessageID,
+			GUID:           m.GUID,
 			Text:           m.Text,
 			Date:           m.Date,
 			IsFromMe:       m.IsFromMe,
@@ -193,6 +201,8 @@ func (w *MessageWatcher) GetMessages(chatID int64, limit int) ([]Message, error)
 			ChatID:         m.ChatID,
 			ChatIdentifier: m.ChatIdent,
 			ChatName:       m.ChatName,
+			Reactions:      m.Reactions,
+			IsReaction:     m.IsReaction,
 		}
 		for _, a := range m.Attachments {
 			msg.Attachments = append(msg.Attachments, Attachment{
@@ -207,82 +217,17 @@ func (w *MessageWatcher) GetMessages(chatID int64, limit int) ([]Message, error)
 		}
 		result = append(result, msg)
 	}
-	return result, nil
+	return result
 }
 
 // GetNewMessages returns messages newer than the given ID.
 func (w *MessageWatcher) GetNewMessages(sinceID int64) ([]Message, error) {
-	db, err := database.DB()
+	msgs, err := database.GetMessagesSince(sinceID)
 	if err != nil {
 		return nil, err
 	}
 
-	query := `
-		SELECT 
-			m.ROWID as message_id,
-			m.text,
-			m.attributedBody,
-			m.date,
-			m.is_from_me,
-			m.is_read,
-			h.id as sender_id,
-			c.ROWID as chat_id,
-			c.chat_identifier,
-			c.display_name
-		FROM message m
-		LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
-		LEFT JOIN chat c ON cmj.chat_id = c.ROWID
-		LEFT JOIN handle h ON m.handle_id = h.ROWID
-		WHERE m.ROWID > ?
-		ORDER BY m.date ASC
-	`
-
-	rows, err := db.Query(query, sinceID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var messages []Message
-	for rows.Next() {
-		var m Message
-		var text, senderID, chatIdent, chatName sql.NullString
-		var attributedBody []byte
-		var date sql.NullInt64
-		var isFromMe, isRead int
-
-		err := rows.Scan(&m.MessageID, &text, &attributedBody, &date, &isFromMe, &isRead, &senderID, &m.ChatID, &chatIdent, &chatName)
-		if err != nil {
-			return nil, err
-		}
-
-		m.IsFromMe = isFromMe == 1
-		m.IsRead = isRead == 1
-		m.ChatIdentifier = chatIdent.String
-		m.ChatName = chatName.String
-
-		if date.Valid {
-			m.Date = database.AppleTimeToTime(date.Int64)
-		}
-
-		m.Text = text.String
-		if m.Text == "" && len(attributedBody) > 0 {
-			m.Text = database.ExtractTextFromAttributedBody(attributedBody)
-		}
-		if m.Text == "" {
-			m.Text = "[Attachment]"
-		}
-
-		m.Sender = database.ResolveSender(m.IsFromMe, senderID.String)
-
-		if m.ChatName == "" {
-			m.ChatName = database.GetContactName(m.ChatIdentifier)
-		}
-
-		messages = append(messages, m)
-	}
-
-	return messages, rows.Err()
+	return messagesFromDatabase(msgs), nil
 }
 
 func (w *MessageWatcher) pollLoop() {

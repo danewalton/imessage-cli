@@ -360,6 +360,7 @@ func cmdRead(conversation string, limit int) error {
 			fmt.Printf("\n%s\n", colored(dateStr, colorDim))
 			fmt.Printf("%s %s\n", colored(msg.Sender+":", colorBlue, colorBold), text)
 		}
+		printReactions(msg)
 	}
 
 	fmt.Println("\n" + strings.Repeat("-", 60))
@@ -370,6 +371,18 @@ func cmdRead(conversation string, limit int) error {
 	}
 	fmt.Println(colored(fmt.Sprintf("Reply: imessage send %s 'your message'", shellQuote(replyTarget)), colorDim))
 	return nil
+}
+
+func printReactions(msg database.Message) {
+	for _, reaction := range msg.Reactions {
+		part := ""
+		if reaction.Part < 0 {
+			part = " (bubble)"
+		} else if reaction.Part > 0 || len(msg.Attachments) > 0 {
+			part = fmt.Sprintf(" (part %d)", reaction.Part+1)
+		}
+		fmt.Printf("  %s\n", colored(reaction.Label()+" "+reaction.Sender+part, colorDim))
+	}
 }
 
 func shellQuote(value string) string {
@@ -447,6 +460,7 @@ func cmdChat(contact string) error {
 			} else {
 				fmt.Printf("  %s %s\n", colored(fmt.Sprintf("[%s] %s:", dateStr, msg.Sender), colorBlue), text)
 			}
+			printReactions(msg)
 		}
 		fmt.Println()
 		return nil

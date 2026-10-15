@@ -9,7 +9,7 @@ A command-line tool for reading and sending iMessages on macOS.
 - **Send messages** - Send iMessages from the command line
 - **Interactive chat** - Real-time chat mode with a contact
 - **Search** - Search through your message history
-- **TUI** - Full terminal user interface with live updates
+- **TUI** - Full terminal user interface with live updates and message reaction badges
 
 ## Requirements
 
@@ -130,6 +130,18 @@ Database access and query failures are reported as errors rather than empty acco
 | `q` | Quit |
 
 Drafts stay with their conversations when you switch chats or the list reorders. A pending send does not accept a second message; the second draft stays in the input. Failed messages are restored only if you have not edited or switched the composer. Otherwise, select the original conversation and use `Ctrl+R` with an empty input to recover the failed message. Drafts and failed messages are kept only for the current TUI session.
+
+### Message reactions
+
+Current Tapbacks appear beneath their original messages, with the reacting person's name. The six standard reactions use emoji labels; custom emoji is shown when its metadata is available. Otherwise it is labelled `Emoji`. Sticker Tapbacks are labelled `Sticker`; their artwork is not decoded.
+
+Reactions to multipart messages include a 1-based body-part number; reactions to an app bubble are marked `bubble`. These numbers refer to Messages' body parts, not necessarily the order of the displayed attachment filenames.
+
+Reaction additions, replacements, removals, and deleted reaction rows update live. Reaction-only refreshes keep the message pane's scroll position and leave the composer unchanged. Reaction events do not appear as separate messages or consume the history limit. `read` and interactive `chat` also show current reaction summaries; search excludes reaction event text.
+
+This feature only reads the database and needs no new permission. Older databases without reaction metadata still load ordinary history. Sending reactions and native threaded replies is not supported.
+
+See [Future TUI improvements](docs/tui-roadmap.md) for message selection, threads, reply composing, and the native-action backend tradeoffs.
 
 ### Private debug logging
 

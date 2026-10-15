@@ -8,9 +8,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/danewalton/imessage-cli/internal/database"
 	"github.com/danewalton/imessage-cli/internal/testutil"
 	"github.com/danewalton/imessage-cli/internal/watcher"
 	"github.com/gdamore/tcell/v2"
@@ -18,12 +20,19 @@ import (
 )
 
 type fakeWatcher struct {
-	convs []watcher.Conversation
-	err   error
+	convs    []watcher.Conversation
+	err      error
+	mu       sync.Mutex
+	messages []watcher.Message
 }
 
 func (w *fakeWatcher) GetConversations(int) ([]watcher.Conversation, error) { return w.convs, w.err }
 func (w *fakeWatcher) GetMessages(id int64, _ int) ([]watcher.Message, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.messages != nil {
+		return append([]watcher.Message(nil), w.messages...), w.err
+	}
 	return []watcher.Message{{MessageID: id, ChatID: id, Text: fmt.Sprintf("chat %d", id)}}, w.err
 }
 func (*fakeWatcher) OnNewMessages(watcher.MessageCallback)               {}
@@ -316,6 +325,7 @@ func TestExternalTextIsLiteral(t *testing.T) {
 			if !strings.Contains(plain, literal) {
 				t.Errorf("lost literal %q: %q", literal, plain)
 			}
+
 		}
 		ui.setStatus("database error [red]")
 		if !strings.Contains(ui.statusBar.GetText(true), "[red]") {
@@ -324,6 +334,85 @@ func TestExternalTextIsLiteral(t *testing.T) {
 	})
 }
 
+func TestReactionBadgesAreLiteralAndPartAware(t *testing.T) {
+	var text strings.Builder
+	ui := NewMessagesTUI()
+	ui.formatMessageLine(&text, watcher.Message{
+		Text: "original message", Sender: "Amber",
+		Attachments: []watcher.Attachment{{Filename: "one.png"}, {Filename: "two.png"}},
+		Reactions: []database.Reaction{
+			{Type: database.ReactionLike, Sender: "Blue", Part: 0},
+			{Type: database.ReactionEmoji, Emoji: "[red]", Sender: "[blue]Me", Part: 1},
+			{Type: database.ReactionSticker, Sender: "Amber", Part: -1},
+		},
+	})
+	view := tview.NewTextView().SetDynamicColors(true).SetText(text.String())
+	plain := view.GetText(true)
+	for _, want := range []string{
+		"original message", "👍 Blue (part 1)", "[red] [blue]Me (part 2)", "Sticker Amber (bubble)",
+	} {
+		if !strings.Contains(plain, want) {
+			t.Errorf("missing literal badge %q: %q", want, plain)
+		}
+	}
+	text.Reset()
+	ui.formatMessageLine(&text, watcher.Message{IsReaction: true, Text: "[Attachment]"})
+	if text.Len() != 0 {
+		t.Error("reaction event rendered as a standalone message")
+	}
+}
+
+func TestLiveReactionsPreserveComposerAndScroll(t *testing.T) {
+	ui := testUI(t)
+	message := watcher.Message{MessageID: 1, GUID: "message-1", ChatID: 1, Text: strings.Repeat("history line\n", 90)}
+	w := &fakeWatcher{messages: []watcher.Message{message}}
+	var convs []watcher.Conversation
+	ui.app.QueueUpdateDraw(func() {
+		ui.watcher = w
+		ui.messages = []watcher.Message{message}
+		ui.msgView.SetScrollable(true).SetWrap(false)
+		ui.renderMessages()
+		ui.inputField.SetText("keep this draft")
+		ui.app.SetFocus(ui.inputField)
+		convs = append([]watcher.Conversation(nil), ui.conversations...)
+	})
+	ui.app.QueueUpdateDraw(func() { ui.msgView.ScrollTo(7, 0) })
+	var row, column int
+	ui.app.QueueUpdateDraw(func() { row, column = ui.msgView.GetScrollOffset() })
+	if row != 7 {
+		t.Fatalf("scroll fixture did not reach requested position: %d", row)
+	}
+	message.Reactions = []database.Reaction{{Type: database.ReactionLike, Sender: "Blue"}}
+	w.mu.Lock()
+	w.messages = []watcher.Message{message}
+	w.mu.Unlock()
+	ui.onNewMessages([]watcher.Message{{MessageID: 2, ChatID: 1, IsReaction: true, Sender: "Blue"}})
+	waitUI(t, ui, func() bool { return strings.Contains(ui.msgView.GetText(true), "👍 Blue") })
+	ui.app.QueueUpdateDraw(func() {
+		gotRow, gotColumn := ui.msgView.GetScrollOffset()
+		if gotRow != row || gotColumn != column || ui.inputField.GetText() != "keep this draft" || ui.app.GetFocus() != ui.inputField {
+			t.Error("reaction update moved the scroll or disturbed the composer")
+		}
+		if !strings.Contains(ui.statusBar.GetText(true), "Reaction updated by Blue") {
+			t.Error("reaction announced as a new message")
+		}
+	})
+	message.Reactions = nil
+	w.mu.Lock()
+	w.messages = []watcher.Message{message}
+	w.mu.Unlock()
+	ui.onConversationsUpdated(convs)
+	waitUI(t, ui, func() bool { return len(ui.messages) == 1 && len(ui.messages[0].Reactions) == 0 })
+	ui.app.QueueUpdateDraw(func() {
+		if strings.Contains(ui.msgView.GetText(true), "👍 Blue") || ui.inputField.GetText() != "keep this draft" {
+			t.Error("deletion-only refresh retained a reaction or changed the draft")
+		}
+		gotRow, gotColumn := ui.msgView.GetScrollOffset()
+		if gotRow != row || gotColumn != column {
+			t.Error("reaction removal moved the scroll")
+		}
+	})
+}
 func TestDebugLoggingDoesNotCaptureComposer(t *testing.T) {
 	ui := testUI(t)
 	var buffer bytes.Buffer

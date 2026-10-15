@@ -66,6 +66,7 @@ The default action (no subcommand) runs `list` with 20 conversations.
 **Files:**
 
 - **`database.go`** — Core database operations: connection management, message/conversation queries, search, and data type conversions.
+- **`reactions.go`** — Optional message-column detection, GUID/part association parsing, and current Tapback snapshots.
 - **`contacts.go`** — Contact resolution: maps phone numbers and emails to human-readable names by reading the macOS AddressBook SQLite databases.
 
 #### Connection Management
@@ -110,11 +111,20 @@ Phone number matching accounts for international format variations (e.g., `+1555
 |----------|-------------|
 | `GetConversations(limit)` | Retrieves recent conversations ordered by last message date, with participant info |
 | `GetMessages(chatID, identifier, limit)` | Fetches messages for a specific chat, ordered oldest-first |
+| `GetMessagesSince(id)` | Shared incremental decoding, including reaction events for watcher notifications |
 | `SearchMessages(query, limit)` | Literal, case-insensitive search over decoded message text, with the result limit applied after matching |
 | `GetUnreadCount()` | Counts messages where `is_read=0` and `is_from_me=0` |
 | `GetContactByIdentifier(id)` | Exact email/phone-variant lookup for direct chats; rejects ambiguity |
 | `GetConversationByID(id)` | Resolves a stable local chat ID, including its Messages GUID and participants |
 | `ResolveSender(isFromMe, senderID)` | Returns "Me", a contact name, or "Unknown" |
+
+#### Reaction snapshots
+
+Message history excludes standard, custom-emoji, and sticker Tapback add/remove rows before applying its limit. One batched query loads reactions for the visible message GUIDs, including rows outside that history window. It matches bare GUIDs, `p:<part>/GUID`, and `bp:GUID` exactly without parsing localized reaction sentences. Optional columns are detected from the schema; custom emoji comes from `associated_message_emoji` when available.
+
+Rows are applied in timestamp/ROWID order. State is keyed by the raw reactor handle and body part, not the resolved display name; outgoing handle variants share the current user's key. Additions replace that person's prior Tapback on the same part. A removal clears only the matching reaction, so an obsolete removal cannot delete its replacement. The snapshots are recomputed from current rows because Messages can also update or delete a reaction in place. Query and malformed-target errors are returned explicitly.
+
+Native attached-sticker assets are not decoded by this feature. Sticker Tapbacks have a text label. No reaction sending or database writes are introduced.
 
 ### `internal/sender` — Message Sending
 
@@ -153,6 +163,8 @@ If both strategies fail, the error is propagated to the caller. A timeout does n
 
 Conversation and message reads return errors separately from empty results. Polling reports errors through error callbacks and advances message/file-change cursors only after the corresponding query succeeds, so a failed read can be retried.
 
+History and incremental reads share database-layer decoding. Incremental callbacks include classified reaction events, while history exposes reaction snapshots on original messages. File-change conversation callbacks also refresh the active TUI history, covering deletion or in-place changes without a new ROWID.
+
 **Thread safety:** Callback slices are guarded by `sync.RWMutex`. The last-seen message ID and mtime are stored as `atomic.Int64` for lock-free reads in the hot path.
 
 **Lifecycle:** `Stop()` closes the stop channel and calls `wg.Wait()` to ensure the poll goroutine exits cleanly.
@@ -188,6 +200,7 @@ Conversation and message reads return errors separately from empty results. Poll
 - **Refresh with timeout:** Conversation refresh and asynchronous message reads each have a 5-second timeout. Errors are displayed separately from empty data, and failed refreshes retain already loaded content.
 - **Literal content:** Message bodies, names, attachment filenames, and error text are escaped before insertion into tview markup.
 - **Live updates:** The `watcher.MessageWatcher` fires callbacks that automatically update the conversation list and message view when new data arrives.
+- **Reaction display:** Current Tapbacks render beneath their target with names and part labels. Labels and names are escaped like message text. Refreshing an unchanged message window preserves its scroll position, including reaction-only additions/removals, without changing the composer.
 - **Debug mode:** `imessage tui --debug` uses a private per-user cache directory (`~/Library/Caches/imessage-cli/tui.log` on macOS). Directory/file permissions are owner-only, and log files must be regular, owned by the current user, and not symlinked or hard-linked. Events record key types and focused widget types, never composer characters.
 
 Search streams messages newest-first, extracts the same text used for reading, and then applies a literal case-insensitive match and result limit. This avoids binary-NUL and serialization-metadata mismatches at the cost of scanning/decoding more history for rare queries; it does not create an index or write to chat.db.

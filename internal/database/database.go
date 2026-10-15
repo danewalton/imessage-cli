@@ -36,6 +36,7 @@ type Attachment struct {
 // Message represents an iMessage.
 type Message struct {
 	MessageID   int64
+	GUID        string
 	Text        string
 	Date        *time.Time
 	IsFromMe    bool
@@ -46,6 +47,8 @@ type Message struct {
 	ChatIdent   string
 	ChatName    string
 	Attachments []Attachment
+	Reactions   []Reaction
+	IsReaction  bool
 }
 
 // Conversation represents a chat/conversation.
@@ -354,6 +357,56 @@ func GetMessages(chatID int64, chatIdentifier string, limit int) ([]Message, err
 		return nil, fmt.Errorf("must provide either chat_id or chat_identifier")
 	}
 
+	schema, err := readMessageSchema(db)
+	if err != nil {
+		return nil, err
+	}
+	messages, err := queryMessages(db, schema,
+		whereClause+" AND NOT "+schema.reactionPredicate("m"),
+		"m.date DESC, m.ROWID DESC LIMIT ?", whereParam, limit)
+	if err != nil {
+		return nil, err
+	}
+
+	// Reverse to show oldest first.
+	for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
+		messages[i], messages[j] = messages[j], messages[i]
+	}
+	if len(messages) > 0 {
+		msgIDs := make([]int64, len(messages))
+		for i, m := range messages {
+			msgIDs[i] = m.MessageID
+		}
+		attMap, err := GetAttachmentsForMessages(msgIDs)
+		if err != nil {
+			return nil, fmt.Errorf("load message attachments: %w", err)
+		}
+		reactions, err := getReactionsForMessages(db, schema, messages)
+		if err != nil {
+			return nil, fmt.Errorf("load message reactions: %w", err)
+		}
+		for i := range messages {
+			messages[i].Attachments = attMap[messages[i].MessageID]
+			messages[i].Reactions = reactions[messages[i].MessageID]
+		}
+	}
+	return messages, nil
+}
+
+// GetMessagesSince includes reaction events so watchers can refresh their targets.
+func GetMessagesSince(sinceID int64) ([]Message, error) {
+	db, err := DB()
+	if err != nil {
+		return nil, err
+	}
+	schema, err := readMessageSchema(db)
+	if err != nil {
+		return nil, err
+	}
+	return queryMessages(db, schema, "m.ROWID > ?", "m.ROWID ASC", sinceID)
+}
+
+func queryMessages(db *sql.DB, schema messageSchema, filter, order string, args ...any) ([]Message, error) {
 	query := fmt.Sprintf(`
 		SELECT 
 			m.ROWID as message_id,
@@ -366,17 +419,18 @@ func GetMessages(chatID int64, chatIdentifier string, limit int) ([]Message, err
 			h.id as sender_id,
 			c.ROWID as chat_id,
 			c.chat_identifier,
-			c.display_name
+			c.display_name,
+			%s,
+			%s
 		FROM message m
 		LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
 		LEFT JOIN chat c ON cmj.chat_id = c.ROWID
 		LEFT JOIN handle h ON m.handle_id = h.ROWID
 		WHERE %s
-		ORDER BY m.date DESC
-		LIMIT ?
-	`, whereClause)
+		ORDER BY %s
+	`, schema.column("m", "guid"), schema.column("m", "associated_message_type"), filter, order)
 
-	rows, err := db.Query(query, whereParam, limit)
+	rows, err := db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -385,19 +439,22 @@ func GetMessages(chatID int64, chatIdentifier string, limit int) ([]Message, err
 	var messages []Message
 	for rows.Next() {
 		var m Message
-		var text, senderID, chatIdent, chatName sql.NullString
+		var text, senderID, chatIdent, chatName, guid sql.NullString
 		var attributedBody []byte
-		var date sql.NullInt64
+		var date, chatID, associatedType sql.NullInt64
 		var isFromMe, isRead int
 		var service sql.NullString
 
-		err := rows.Scan(&m.MessageID, &text, &attributedBody, &date, &isFromMe, &isRead, &service, &senderID, &m.ChatID, &chatIdent, &chatName)
+		err := rows.Scan(&m.MessageID, &text, &attributedBody, &date, &isFromMe, &isRead, &service, &senderID, &chatID, &chatIdent, &chatName, &guid, &associatedType)
 		if err != nil {
 			return nil, fmt.Errorf("read message: %w", err)
 		}
 
 		m.IsFromMe = isFromMe == 1
 		m.IsRead = isRead == 1
+		m.GUID = guid.String
+		m.ChatID = chatID.Int64
+		m.IsReaction = isReactionType(associatedType.Int64)
 		m.Service = service.String
 		m.ChatIdent = chatIdent.String
 		m.ChatName = chatName.String
@@ -411,7 +468,7 @@ func GetMessages(chatID int64, chatIdentifier string, limit int) ([]Message, err
 		if m.Text == "" && len(attributedBody) > 0 {
 			m.Text = ExtractTextFromAttributedBody(attributedBody)
 		}
-		if m.Text == "" {
+		if m.Text == "" && !m.IsReaction {
 			m.Text = "[Attachment]"
 		}
 
@@ -432,30 +489,6 @@ func GetMessages(chatID int64, chatIdentifier string, limit int) ([]Message, err
 		return nil, err
 	}
 
-	// Reverse to show oldest first
-	for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
-		messages[i], messages[j] = messages[j], messages[i]
-	}
-
-	// Batch-load attachments for all messages
-	if len(messages) > 0 {
-		msgIDs := make([]int64, len(messages))
-		for i, m := range messages {
-			msgIDs[i] = m.MessageID
-		}
-		attMap, err := GetAttachmentsForMessages(msgIDs)
-		if err != nil {
-			return nil, fmt.Errorf("load message attachments: %w", err)
-		}
-		if attMap != nil {
-			for i := range messages {
-				if atts, ok := attMap[messages[i].MessageID]; ok {
-					messages[i].Attachments = atts
-				}
-			}
-		}
-	}
-
 	return messages, nil
 }
 
@@ -466,7 +499,11 @@ func SearchMessages(query string, limit int) ([]Message, error) {
 		return nil, err
 	}
 
-	sqlQuery := `
+	schema, err := readMessageSchema(db)
+	if err != nil {
+		return nil, err
+	}
+	sqlQuery := fmt.Sprintf(`
 		SELECT 
 			m.ROWID as message_id,
 			m.text,
@@ -480,9 +517,9 @@ func SearchMessages(query string, limit int) ([]Message, error) {
 		LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
 		LEFT JOIN chat c ON cmj.chat_id = c.ROWID
 		LEFT JOIN handle h ON m.handle_id = h.ROWID
-		WHERE m.text IS NOT NULL OR m.attributedBody IS NOT NULL
-		ORDER BY m.date DESC
-	`
+		WHERE (m.text IS NOT NULL OR m.attributedBody IS NOT NULL) AND NOT %s
+		ORDER BY m.date DESC, m.ROWID DESC
+	`, schema.reactionPredicate("m"))
 
 	rows, err := db.Query(sqlQuery)
 	if err != nil {

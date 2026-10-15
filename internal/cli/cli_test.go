@@ -112,6 +112,35 @@ func TestCLIRegressions(t *testing.T) {
 		}
 	})
 
+	t.Run("read and chat show reaction snapshots", func(t *testing.T) {
+		testutil.ReactionSchema(t, db)
+		testutil.Exec(t, db, `
+			INSERT INTO message (ROWID, text, date, is_from_me, is_read, handle_id,
+				associated_message_guid, associated_message_type)
+				VALUES (3,'reaction control',300,0,1,2,'p:0/message-1',2001);
+			INSERT INTO chat_message_join VALUES (1,3)
+		`)
+		defer testutil.Exec(t, db, "DELETE FROM chat_message_join WHERE message_id=3; DELETE FROM message WHERE ROWID=3")
+		out := testutil.Output(t, func() {
+			if err := cmdRead("chat:1", 1); err != nil {
+				t.Error(err)
+			}
+		})
+		if !strings.Contains(out, "phone message") || !strings.Contains(out, "👍 blue@example.test") || strings.Contains(out, "reaction control") {
+			t.Errorf("read reaction presentation: %s", out)
+		}
+		testutil.Input(t, "quit\n", func() {
+			out := testutil.Output(t, func() {
+				if err := cmdChat("chat:1"); err != nil {
+					t.Error(err)
+				}
+			})
+			if !strings.Contains(out, "👍 blue@example.test") || strings.Contains(out, "reaction control") {
+				t.Errorf("chat reaction presentation: %s", out)
+			}
+		})
+	})
+
 	t.Run("status propagates database errors", func(t *testing.T) {
 		testutil.Exec(t, db, "ALTER TABLE message RENAME TO hidden_message")
 		var statusErr error
